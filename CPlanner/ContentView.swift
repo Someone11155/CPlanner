@@ -8,6 +8,9 @@
 import SwiftUI
 import Combine
 import EventKit
+import os
+
+private let taskManagerLogger = Logger(subsystem: "com.cplanner", category: "TaskManager")
 
 // --- 1. 모델 정의 ---
 struct TaskItem: Identifiable {
@@ -30,70 +33,123 @@ struct FolderRule: Identifiable, Codable {
 class TaskManager: ObservableObject {
     @Published var tasks: [TaskItem] = []
     @Published var folderRules: [FolderRule] = []
-    
-    let eventStore = EKEventStore()
+    @Published var lastCalendarError: String?
+
+    private let eventStore = EKEventStore()
     private var monitors: [UUID: FolderMonitor] = [:]
-    
-    // 할 일 추가 (AI 분류 적용)
-    func addTask(title: String, date: Date) {
-        Task {
-            let folders = folderRules.map { $0.folderName }
-            // AI에게 맥락 분류 요청
-            let detectedFolder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folders)
-            
-            DispatchQueue.main.async {
-                let newTask = TaskItem(title: title, targetFolder: detectedFolder, date: date)
-                self.tasks.append(newTask)
-                self.saveToMacCalendar(title: title, date: date)
-            }
+    private var calendarAccessGranted = false
+
+    deinit {
+        for monitor in monitors.values {
+            monitor.stopMonitoring()
         }
     }
-    
+
+    // 할 일 추가 (AI 분류 적용)
+    func addTask(title: String, date: Date) {
+        Task { [weak self] in
+            guard let self else { return }
+            let folders = self.folderRules.map { $0.folderName }
+            let detectedFolder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folders)
+            let newTask = TaskItem(title: title, targetFolder: detectedFolder, date: date)
+            self.tasks.append(newTask)
+            await self.saveToMacCalendar(title: title, date: date)
+        }
+    }
+
     func deleteTask(id: UUID) { tasks.removeAll { $0.id == id } }
-    
+
     // 감시 규칙 추가
     func addRule(name: String, keywords: [String], url: URL) {
         let newRule = FolderRule(folderName: name, keywords: keywords, folderURLPath: url.path)
         folderRules.append(newRule)
         startMonitoring(rule: newRule)
     }
-    
+
     func deleteRule(id: UUID) {
         folderRules.removeAll { $0.id == id }
         monitors[id]?.stopMonitoring()
         monitors.removeValue(forKey: id)
     }
-    
+
     // 폴더 감시 시작
     private func startMonitoring(rule: FolderRule) {
         let monitor = FolderMonitor(url: rule.url)
-        monitor.folderDidChange = { [weak self] in self?.handleNewFileDetected(in: rule) }
+        let ruleID = rule.id
+        monitor.folderDidChange = { [weak self] in
+            self?.handleNewFileDetected(ruleID: ruleID)
+        }
         monitor.startMonitoring()
-        monitors[rule.id] = monitor
+        monitors[ruleID] = monitor
     }
-    
+
     // 파일 감지 시 AI 검증 로직 실행
-    private func handleNewFileDetected(in rule: FolderRule) {
-        let newFileName = "과제제출본.pdf" // 실제로는 FileManager를 통해 최신 파일명을 가져옵니다.
-        
-        Task {
-            let isValid = await LocalLLMService.shared.validateFileContext(fileName: newFileName, folderName: rule.folderName)
-            if isValid {
-                DispatchQueue.main.async {
-                    if let idx = self.tasks.firstIndex(where: { $0.targetFolder == rule.folderName && !$0.isCompleted }) {
-                        self.tasks[idx].isCompleted = true
-                    }
-                }
+    private func handleNewFileDetected(ruleID: UUID) {
+        guard let rule = folderRules.first(where: { $0.id == ruleID }) else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            let contents: [URL]
+            do {
+                contents = try FileManager.default.contentsOfDirectory(
+                    at: rule.url,
+                    includingPropertiesForKeys: [.contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )
+            } catch {
+                taskManagerLogger.error("Failed to enumerate folder \(rule.url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                return
+            }
+
+            let newest = contents.max { a, b in
+                let aDate = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let bDate = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return aDate < bDate
+            }
+            guard let fileName = newest?.lastPathComponent else { return }
+
+            let isValid = await LocalLLMService.shared.validateFileContext(fileName: fileName, folderName: rule.folderName)
+            guard isValid else { return }
+
+            if let idx = self.tasks.firstIndex(where: { $0.targetFolder == rule.folderName && !$0.isCompleted }) {
+                self.tasks[idx].isCompleted = true
             }
         }
     }
-    
-    private func saveToMacCalendar(title: String, date: Date) {
-        let event = EKEvent(eventStore: eventStore)
-        event.title = "[Cplanner] \(title)"
-        event.startDate = date; event.endDate = date; event.isAllDay = true
-        event.calendar = eventStore.defaultCalendarForNewEvents
-        try? eventStore.save(event, span: .thisEvent)
+
+    private func saveToMacCalendar(title: String, date: Date) async {
+        do {
+            if !calendarAccessGranted {
+                let granted: Bool
+                if #available(macOS 14, *) {
+                    granted = try await eventStore.requestFullAccessToEvents()
+                } else {
+                    granted = try await eventStore.requestAccess(to: .event)
+                }
+                calendarAccessGranted = granted
+                guard granted else {
+                    lastCalendarError = "캘린더 접근 권한이 거부되었습니다."
+                    return
+                }
+            }
+
+            guard let calendar = eventStore.defaultCalendarForNewEvents else {
+                lastCalendarError = "기본 캘린더를 찾을 수 없습니다."
+                return
+            }
+
+            let event = EKEvent(eventStore: eventStore)
+            event.title = "[Cplanner] \(title)"
+            event.startDate = date
+            event.endDate = date
+            event.isAllDay = true
+            event.calendar = calendar
+            try eventStore.save(event, span: .thisEvent)
+            lastCalendarError = nil
+        } catch {
+            lastCalendarError = "캘린더 저장 실패: \(error.localizedDescription)"
+            taskManagerLogger.error("Calendar save failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }
 
@@ -101,13 +157,13 @@ class TaskManager: ObservableObject {
 struct CustomCalendarView: View {
     @ObservedObject var taskManager: TaskManager
     @Binding var selectedDate: Date
-    
+
+    private let calendar = Calendar.current
     private let calendarHeaderColor = Color(NSColor.windowBackgroundColor)
     private let selectionColor = Color.blue
     let weekdayNames = ["일", "월", "화", "수", "목", "금", "토"]
-    
+
     func generateDaysInMonth() -> [Date] {
-        let calendar = Calendar.current
         guard let monthRange = calendar.range(of: .day, in: .month, for: selectedDate),
               let firstOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: selectedDate)) else { return [] }
         let firstWeekday = calendar.component(.weekday, from: firstOfMonth)
@@ -133,7 +189,7 @@ struct CustomCalendarView: View {
                     Button(action: { changeMonth(value: 1) }) { Image(systemName: "chevron.right") }
                 }.buttonStyle(.plain).font(.title3)
             }.padding().background(calendarHeaderColor)
-            
+
             Divider()
             Grid(horizontalSpacing: 0, verticalSpacing: 0) {
                 GridRow {
@@ -145,22 +201,25 @@ struct CustomCalendarView: View {
                 }.background(calendarHeaderColor)
             }
             Divider()
-            
+
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 0) {
                 ForEach(generateDaysInMonth(), id: \.self) { date in
-                    let isWeekend = Calendar.current.component(.weekday, from: date) == 1 || Calendar.current.component(.weekday, from: date) == 7
+                    let weekday = calendar.component(.weekday, from: date)
+                    let isWeekend = weekday == 1 || weekday == 7
+                    let isSelectedDay = calendar.isDate(date, inSameDayAs: selectedDate)
+                    let inSameMonth = calendar.isDate(date, equalTo: selectedDate, toGranularity: .month)
                     VStack {
                         ZStack {
-                            if Calendar.current.isDate(date, inSameDayAs: selectedDate) {
+                            if isSelectedDay {
                                 Circle().fill(selectionColor).frame(width: 30, height: 30)
                             }
-                            Text("\(Calendar.current.component(.day, from: date))")
+                            Text("\(calendar.component(.day, from: date))")
                                 .font(.system(size: 14))
-                                .fontWeight(Calendar.current.isDate(date, inSameDayAs: selectedDate) ? .bold : .medium)
-                                .foregroundColor(isSameMonth(date1: date, date2: selectedDate) ? (Calendar.current.isDate(date, inSameDayAs: selectedDate) ? .white : .primary) : .secondary.opacity(0.5))
+                                .fontWeight(isSelectedDay ? .bold : .medium)
+                                .foregroundColor(inSameMonth ? (isSelectedDay ? .white : .primary) : .secondary.opacity(0.5))
                         }
                         if hasTasks(date: date) {
-                            Circle().fill(isSameMonth(date1: date, date2: selectedDate) ? (Calendar.current.isDate(date, inSameDayAs: selectedDate) ? .white : .blue) : .secondary.opacity(0.5)).frame(width: 4, height: 4)
+                            Circle().fill(inSameMonth ? (isSelectedDay ? .white : .blue) : .secondary.opacity(0.5)).frame(width: 4, height: 4)
                         }
                     }
                     .frame(height: 50).frame(maxWidth: .infinity)
@@ -170,17 +229,16 @@ struct CustomCalendarView: View {
                     .onTapGesture { self.selectedDate = date }
                 }
             }.background(Color(NSColor.controlBackgroundColor))
-            
+
             Divider()
             Spacer()
         }.background(Color(NSColor.controlBackgroundColor))
     }
-    
+
     func changeMonth(value: Int) {
-        if let newDate = Calendar.current.date(byAdding: .month, value: value, to: selectedDate) { selectedDate = newDate }
+        if let newDate = calendar.date(byAdding: .month, value: value, to: selectedDate) { selectedDate = newDate }
     }
-    func isSameMonth(date1: Date, date2: Date) -> Bool { Calendar.current.isDate(date1, equalTo: date2, toGranularity: .month) }
-    func hasTasks(date: Date) -> Bool { taskManager.tasks.contains { Calendar.current.isDate($0.date, inSameDayAs: date) } }
+    func hasTasks(date: Date) -> Bool { taskManager.tasks.contains { calendar.isDate($0.date, inSameDayAs: date) } }
 }
 
 // --- 4. 메인 UI 화면 ---
@@ -190,15 +248,15 @@ struct ContentView: View {
     @State private var isAddingTask = false
     @State private var showSettings = false
     @State private var newTaskTitle = ""
-    
+
     var body: some View {
         HStack(spacing: 0) {
             // 좌측 캘린더
             CustomCalendarView(taskManager: taskManager, selectedDate: $selectedDate)
                 .frame(width: 300)
-            
+
             Divider()
-            
+
             // 우측 할 일 목록
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
@@ -207,7 +265,15 @@ struct ContentView: View {
                     Button(action: { showSettings.toggle() }) { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.secondary) }.buttonStyle(.plain).padding(.trailing, 10)
                     Button(action: { withAnimation { isAddingTask.toggle() } }) { Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill").font(.title).foregroundColor(isAddingTask ? .gray : .blue) }.buttonStyle(.plain)
                 }.padding(.horizontal).padding(.top, 25).padding(.bottom, 15)
-                
+
+                if let calendarError = taskManager.lastCalendarError {
+                    Text("⚠️ \(calendarError)")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal)
+                        .padding(.bottom, 5)
+                }
+
                 if isAddingTask {
                     VStack(spacing: 12) {
                         TextField("할 일 제목 (예: 운영체제 과제)", text: $newTaskTitle)
@@ -224,22 +290,23 @@ struct ContentView: View {
                         }
                     }.padding().background(Color(NSColor.windowBackgroundColor)).cornerRadius(10).padding(.horizontal).padding(.bottom, 10)
                 }
-                
+
                 List {
                     ForEach(taskManager.tasks.filter { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }) { task in
-                        let index = taskManager.tasks.firstIndex(where: { $0.id == task.id })!
-                        HStack {
-                            Image(systemName: taskManager.tasks[index].isCompleted ? "checkmark.circle.fill" : "circle")
-                                .foregroundColor(taskManager.tasks[index].isCompleted ? .blue : .gray).font(.title3)
-                                .onTapGesture { taskManager.tasks[index].isCompleted.toggle() }
-                            VStack(alignment: .leading) {
-                                Text(task.title).strikethrough(taskManager.tasks[index].isCompleted).foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary).font(.headline)
-                                Text("📁 자동 분류됨: \(task.targetFolder)").font(.caption).foregroundColor(.secondary)
+                        if let index = taskManager.tasks.firstIndex(where: { $0.id == task.id }) {
+                            HStack {
+                                Image(systemName: taskManager.tasks[index].isCompleted ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .blue : .gray).font(.title3)
+                                    .onTapGesture { taskManager.tasks[index].isCompleted.toggle() }
+                                VStack(alignment: .leading) {
+                                    Text(task.title).strikethrough(taskManager.tasks[index].isCompleted).foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary).font(.headline)
+                                    Text("📁 자동 분류됨: \(task.targetFolder)").font(.caption).foregroundColor(.secondary)
+                                }
+                                Spacer()
                             }
-                            Spacer()
+                            .padding(.vertical, 6)
+                            .contextMenu { Button(role: .destructive) { taskManager.deleteTask(id: task.id) } label: { Label("삭제", systemImage: "trash") } }
                         }
-                        .padding(.vertical, 6)
-                        .contextMenu { Button(role: .destructive) { taskManager.deleteTask(id: task.id) } label: { Label("삭제", systemImage: "trash") } }
                     }
                 }.listStyle(.inset)
             }
@@ -255,11 +322,11 @@ struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @State private var newFolderName = ""
     @State private var selectedURL: URL? = nil
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             Text("⚙️ 감시 규칙 및 실제 폴더 연결").font(.title2).fontWeight(.bold)
-            
+
             List {
                 ForEach(taskManager.folderRules) { rule in
                     HStack {
@@ -271,7 +338,7 @@ struct SettingsView: View {
                     }.padding(.vertical, 4)
                 }
             }.listStyle(.bordered).frame(height: 150)
-            
+
             Divider()
             Text("새 감시 폴더 추가").font(.headline)
             VStack(spacing: 10) {
@@ -283,16 +350,16 @@ struct SettingsView: View {
                 }
                 Button("추가하고 감시 시작하기") {
                     if !newFolderName.isEmpty, let url = selectedURL {
-                        taskManager.addRule(name: newFolderName, keywords: [newFolderName], url: url) // 키워드 입력 생략, AI가 이름 기반으로 분석
+                        taskManager.addRule(name: newFolderName, keywords: [newFolderName], url: url)
                         newFolderName = ""; selectedURL = nil
                     }
                 }.buttonStyle(.borderedProminent).disabled(newFolderName.isEmpty || selectedURL == nil)
             }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
-            
+
             HStack { Spacer(); Button("닫기") { dismiss() }.keyboardShortcut(.escape) }
         }.padding().frame(width: 500, height: 450)
     }
-    
+
     private func selectFolderFromMac() {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
         if panel.runModal() == .OK { self.selectedURL = panel.url }
@@ -300,7 +367,9 @@ struct SettingsView: View {
 }
 
 extension DateFormatter {
-    static var monthYearFormatter: DateFormatter {
-        let formatter = DateFormatter(); formatter.dateFormat = "YYYY년 MM월"; return formatter
-    }
+    static let monthYearFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "YYYY년 MM월"
+        return formatter
+    }()
 }
