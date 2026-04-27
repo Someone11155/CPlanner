@@ -9,54 +9,101 @@ import Foundation
 import CoreML
 import Tokenizers
 import Hub
+import os
+
+private let llmLogger = Logger(subsystem: "com.cplanner", category: "LocalLLMService")
+
+/// Single uppercase letters A–Z used as classification targets.
+/// 26 folders is more than enough in practice; if a user defines more
+/// than 26, the trailing folders are silently unreachable from the
+/// classifier and we log a warning.
+private let classificationLabelAlphabet: [String] =
+    (0..<26).map { i in String(UnicodeScalar(UInt8(0x41 + i))) }
 
 @available(macOS 15.0, iOS 18.0, *)
-final class LocalLLMService: @unchecked Sendable {
+actor LocalLLMService {
     static let shared = LocalLLMService()
-    
+
     private var tokenizer: Tokenizer?
     private var monoModel: MLModel?
-    private var isReady = false
-    
-    private init() {
-        Task { await setupMistral() }
+    private var loadTask: Task<Void, Never>?
+
+    private init() {}
+
+    /// Kick off model loading. Safe to call multiple times — subsequent
+    /// calls observe the in-flight `loadTask` rather than starting a new
+    /// load. Callers that just need the model ready before use should
+    /// `await` `classifyTask`, which calls `ensureLoaded()` internally.
+    func preload() {
+        ensureLoadTaskStarted()
     }
-    
+
+    private func ensureLoadTaskStarted() {
+        if loadTask == nil {
+            loadTask = Task { [weak self] in
+                await self?.setupMistral()
+            }
+        }
+    }
+
+    private func ensureLoaded() async {
+        ensureLoadTaskStarted()
+        await loadTask?.value
+    }
+
     private func setupMistral() async {
-        print("⏳ [Mistral 7B] 모델 로딩 시작...")
+        llmLogger.info("[Mistral 7B] 모델 로딩 시작")
         do {
-            guard let resourceURL = Bundle.main.resourceURL else { return }
+            guard let resourceURL = Bundle.main.resourceURL else {
+                llmLogger.error("Bundle.main.resourceURL is nil")
+                return
+            }
             self.tokenizer = try await AutoTokenizer.from(modelFolder: resourceURL)
-            
+
             let configML = MLModelConfiguration()
             configML.computeUnits = .all
-            
+
             let modelName = "StatefulMistral7BInstructInt4"
-            if let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") {
-                self.monoModel = try MLModel(contentsOf: modelURL, configuration: configML)
-                print("✅ [Mistral 7B] 로딩 완료!")
-                self.isReady = true
-            } else {
-                print("🚨 모델 파일을 찾을 수 없습니다 (mlmodelc).")
+            guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") else {
+                llmLogger.error("모델 파일을 찾을 수 없습니다 (mlmodelc).")
+                return
             }
+            self.monoModel = try MLModel(contentsOf: modelURL, configuration: configML)
+            llmLogger.info("[Mistral 7B] 로딩 완료")
         } catch {
-            print("🚨 초기화 실패: \(error)")
+            llmLogger.error("초기화 실패: \(error.localizedDescription, privacy: .public)")
         }
     }
-    
+
     func classifyTask(taskTitle: String, availableFolders: [String]) async -> String {
-        guard isReady, let tokenizer = self.tokenizer, let model = self.monoModel else {
+        await ensureLoaded()
+        guard let tokenizer = self.tokenizer, let model = self.monoModel else {
             return "일반"
         }
-        
-        // 1. 프롬프트 생성 (Few-shot 포함)
-        var optionsText = ""
-        let labels = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
-        for (i, folder) in availableFolders.enumerated() {
-            if i < labels.count { optionsText += "\(labels[i]). \(folder)\n" }
+
+        // Strip Mistral instruct delimiters from the user-supplied title
+        // so a malicious task name cannot break out of the prompt.
+        let sanitizedTitle = taskTitle
+            .replacingOccurrences(of: "[INST]", with: "")
+            .replacingOccurrences(of: "[/INST]", with: "")
+            .replacingOccurrences(of: "<s>", with: "")
+            .replacingOccurrences(of: "</s>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let usableFolders = Array(availableFolders.prefix(classificationLabelAlphabet.count))
+        if availableFolders.count > usableFolders.count {
+            llmLogger.warning("More than \(classificationLabelAlphabet.count) folders provided; trailing entries will not be classifiable.")
         }
-        
-        // Mistral Instruct v3 포맷 준수
+        let labels = Array(classificationLabelAlphabet.prefix(usableFolders.count))
+
+        guard !labels.isEmpty else { return "일반" }
+
+        var optionsText = ""
+        for (i, folder) in usableFolders.enumerated() {
+            optionsText += "\(labels[i]). \(folder)\n"
+        }
+
+        // Mistral Instruct v3 포맷
         let prompt = """
         [INST] 분류 전문가로서 할 일을 카테고리 중 하나로 분류하세요. 대문자 알파벳 한 글자만 답하세요.
         카테고리:
@@ -64,70 +111,65 @@ final class LocalLLMService: @unchecked Sendable {
         B. 공부
         할 일: 헬스장 가기 [/INST] A </s> [INST] 카테고리:
         \(optionsText)
-        할 일: \(taskTitle) [/INST] 
+        할 일: \(sanitizedTitle) [/INST]
         """
-        
+
         let inputTokens = tokenizer.encode(text: prompt)
-        
+
         do {
             let state = model.makeState()
             var finalLogits: MLMultiArray?
-            
-            // 2. NPU 추론 실행
+
             for (i, tokenID) in inputTokens.enumerated() {
                 let inputIds = MLShapedArray<Int32>(scalars: [Int32(tokenID)], shape: [1, 1])
                 let causalMask = MLShapedArray<Float16>(scalars: [0.0], shape: [1, 1, 1, 1])
-                
+
                 let inputs: [String: Any] = [
                     "inputIds": MLMultiArray(inputIds),
                     "causalMask": MLMultiArray(causalMask)
                 ]
-                
+
                 let provider = try MLDictionaryFeatureProvider(dictionary: inputs)
                 let prediction = try await model.prediction(from: provider, using: state)
-                
+
                 if i == inputTokens.count - 1 {
                     finalLogits = prediction.featureValue(for: "logits")?.multiArrayValue
                 }
             }
-            
-            // 3. 결과 분석 및 추출
+
             if let logits = finalLogits {
                 let topTokens = getTopK(from: logits, k: 10)
-                
                 for token in topTokens {
                     let word = tokenizer.decode(tokens: [token])
-                    let clean = word.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                                    .trimmingCharacters(in: CharacterSet.punctuationCharacters)
+                    let clean = word.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .trimmingCharacters(in: .punctuationCharacters)
                                     .uppercased()
-                    
-                    if clean.count == 1, labels.contains(clean) {
-                        if let index = labels.firstIndex(of: clean), index < availableFolders.count {
-                            let result = availableFolders[index]
-                            print("🎯 [Mistral] 분류 성공: \(taskTitle) -> \(result) (\(clean))")
-                            return result
-                        }
+                    if clean.count == 1, let index = labels.firstIndex(of: clean) {
+                        let result = usableFolders[index]
+                        llmLogger.info("[Mistral] 분류 성공: \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(clean, privacy: .public))")
+                        return result
                     }
                 }
             }
         } catch {
-            print("🚨 추론 중 에러: \(error)")
+            llmLogger.error("추론 중 에러: \(error.localizedDescription, privacy: .public)")
         }
-        
-        print("⚠️ [Mistral] 분류 실패: '일반'으로 반환")
+
+        llmLogger.warning("[Mistral] 분류 실패, '일반'으로 반환")
         return "일반"
     }
-    
+
     private func getTopK(from logits: MLMultiArray, k: Int) -> [Int] {
         var topTokens = [(index: Int, score: Float)]()
+        topTokens.reserveCapacity(logits.count)
         for i in 0..<logits.count {
             topTokens.append((index: i, score: logits[i].floatValue))
         }
         topTokens.sort { $0.score > $1.score }
         return topTokens.prefix(k).map { $0.index }
     }
-    
-    func validateFileContext(fileName: String, folderName: String) async -> Bool {
+
+    nonisolated func validateFileContext(fileName: String, folderName: String) -> Bool {
         let lower = fileName.lowercased()
         let junk = [".dmg", ".exe", ".mp4", ".zip"]
         return !junk.contains(where: { lower.hasSuffix($0) }) && lower.count >= 2

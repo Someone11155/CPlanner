@@ -139,7 +139,7 @@ class TaskManager: ObservableObject {
             }
             guard let fileName = newest?.lastPathComponent else { return }
 
-            let isValid = await LocalLLMService.shared.validateFileContext(fileName: fileName, folderName: rule.folderName)
+            let isValid = LocalLLMService.shared.validateFileContext(fileName: fileName, folderName: rule.folderName)
             guard isValid else { return }
 
             if let idx = self.tasks.firstIndex(where: { $0.targetFolder == rule.folderName && !$0.isCompleted }) {
