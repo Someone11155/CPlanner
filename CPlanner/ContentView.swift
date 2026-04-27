@@ -24,7 +24,6 @@ struct TaskItem: Identifiable, Codable {
 struct FolderRule: Identifiable, Codable {
     var id = UUID()
     var folderName: String
-    var keywords: [String]
     var bookmark: Data
 
     /// Resolves the security-scoped bookmark.
@@ -107,8 +106,8 @@ class TaskManager: ObservableObject {
     func deleteTask(id: UUID) { tasks.removeAll { $0.id == id } }
 
     // 감시 규칙 추가
-    func addRule(name: String, keywords: [String], bookmark: Data) {
-        let newRule = FolderRule(folderName: name, keywords: keywords, bookmark: bookmark)
+    func addRule(name: String, bookmark: Data) {
+        let newRule = FolderRule(folderName: name, bookmark: bookmark)
         folderRules.append(newRule)
         startMonitoring(rule: newRule)
     }
@@ -428,7 +427,7 @@ struct SettingsView: View {
                                 includingResourceValuesForKeys: nil,
                                 relativeTo: nil
                             )
-                            taskManager.addRule(name: newFolderName, keywords: [newFolderName], bookmark: bookmark)
+                            taskManager.addRule(name: newFolderName, bookmark: bookmark)
                             newFolderName = ""; selectedURL = nil; addRuleError = nil
                         } catch {
                             addRuleError = "북마크 생성 실패: \(error.localizedDescription)"
