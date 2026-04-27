@@ -25,8 +25,22 @@ struct FolderRule: Identifiable, Codable {
     var id = UUID()
     var folderName: String
     var keywords: [String]
-    var folderURLPath: String
-    var url: URL { URL(fileURLWithPath: folderURLPath) }
+    var bookmark: Data
+
+    /// Resolves the security-scoped bookmark.
+    /// Caller MUST call `startAccessingSecurityScopedResource()` on the
+    /// returned URL before reading the folder, and the matching
+    /// `stopAccessingSecurityScopedResource()` once finished.
+    func resolveURL() throws -> (url: URL, isStale: Bool) {
+        var isStale = false
+        let url = try URL(
+            resolvingBookmarkData: bookmark,
+            options: [.withSecurityScope],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        )
+        return (url, isStale)
+    }
 }
 
 // --- 2. 메인 매니저 ---
@@ -36,12 +50,13 @@ class TaskManager: ObservableObject {
     @Published var lastCalendarError: String?
 
     private let eventStore = EKEventStore()
-    private var monitors: [UUID: FolderMonitor] = [:]
+    private var monitors: [UUID: (monitor: FolderMonitor, scopedURL: URL)] = [:]
     private var calendarAccessGranted = false
 
     deinit {
-        for monitor in monitors.values {
-            monitor.stopMonitoring()
+        for entry in monitors.values {
+            entry.monitor.stopMonitoring()
+            entry.scopedURL.stopAccessingSecurityScopedResource()
         }
     }
 
@@ -60,44 +75,60 @@ class TaskManager: ObservableObject {
     func deleteTask(id: UUID) { tasks.removeAll { $0.id == id } }
 
     // 감시 규칙 추가
-    func addRule(name: String, keywords: [String], url: URL) {
-        let newRule = FolderRule(folderName: name, keywords: keywords, folderURLPath: url.path)
+    func addRule(name: String, keywords: [String], bookmark: Data) {
+        let newRule = FolderRule(folderName: name, keywords: keywords, bookmark: bookmark)
         folderRules.append(newRule)
         startMonitoring(rule: newRule)
     }
 
     func deleteRule(id: UUID) {
         folderRules.removeAll { $0.id == id }
-        monitors[id]?.stopMonitoring()
+        if let entry = monitors[id] {
+            entry.monitor.stopMonitoring()
+            entry.scopedURL.stopAccessingSecurityScopedResource()
+        }
         monitors.removeValue(forKey: id)
     }
 
     // 폴더 감시 시작
     private func startMonitoring(rule: FolderRule) {
-        let monitor = FolderMonitor(url: rule.url)
-        let ruleID = rule.id
-        monitor.folderDidChange = { [weak self] in
-            self?.handleNewFileDetected(ruleID: ruleID)
+        do {
+            let (url, isStale) = try rule.resolveURL()
+            if isStale {
+                taskManagerLogger.warning("Bookmark for \(rule.folderName, privacy: .public) is stale; user should reselect the folder.")
+            }
+            guard url.startAccessingSecurityScopedResource() else {
+                taskManagerLogger.error("Failed to start security-scoped access for \(url.path, privacy: .public)")
+                return
+            }
+            let monitor = FolderMonitor(url: url)
+            let ruleID = rule.id
+            monitor.folderDidChange = { [weak self] in
+                self?.handleNewFileDetected(ruleID: ruleID)
+            }
+            monitor.startMonitoring()
+            monitors[ruleID] = (monitor: monitor, scopedURL: url)
+        } catch {
+            taskManagerLogger.error("Failed to resolve bookmark for \(rule.folderName, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
-        monitor.startMonitoring()
-        monitors[ruleID] = monitor
     }
 
     // 파일 감지 시 AI 검증 로직 실행
     private func handleNewFileDetected(ruleID: UUID) {
-        guard let rule = folderRules.first(where: { $0.id == ruleID }) else { return }
+        guard let rule = folderRules.first(where: { $0.id == ruleID }),
+              let scopedURL = monitors[ruleID]?.scopedURL else { return }
 
         Task { [weak self] in
             guard let self else { return }
             let contents: [URL]
             do {
                 contents = try FileManager.default.contentsOfDirectory(
-                    at: rule.url,
+                    at: scopedURL,
                     includingPropertiesForKeys: [.contentModificationDateKey],
                     options: [.skipsHiddenFiles]
                 )
             } catch {
-                taskManagerLogger.error("Failed to enumerate folder \(rule.url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                taskManagerLogger.error("Failed to enumerate folder \(scopedURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 return
             }
 
@@ -322,6 +353,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @State private var newFolderName = ""
     @State private var selectedURL: URL? = nil
+    @State private var addRuleError: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
@@ -331,7 +363,12 @@ struct SettingsView: View {
                 ForEach(taskManager.folderRules) { rule in
                     HStack {
                         VStack(alignment: .leading) {
-                            Text("📁 \(rule.folderName) (경로: \(rule.url.lastPathComponent))").font(.headline)
+                            Text("📁 \(rule.folderName)").font(.headline)
+                            if let resolved = try? rule.resolveURL() {
+                                Text(resolved.url.lastPathComponent).font(.caption).foregroundColor(.secondary)
+                            } else {
+                                Text("(경로 해석 실패 — 폴더를 다시 선택하세요)").font(.caption).foregroundColor(.red)
+                            }
                         }
                         Spacer()
                         Button("삭제") { taskManager.deleteRule(id: rule.id) }.buttonStyle(.plain).foregroundColor(.red)
@@ -348,10 +385,22 @@ struct SettingsView: View {
                     Spacer()
                     Button("폴더 찾기") { selectFolderFromMac() }
                 }
+                if let addRuleError {
+                    Text("⚠️ \(addRuleError)").font(.caption).foregroundColor(.orange)
+                }
                 Button("추가하고 감시 시작하기") {
                     if !newFolderName.isEmpty, let url = selectedURL {
-                        taskManager.addRule(name: newFolderName, keywords: [newFolderName], url: url)
-                        newFolderName = ""; selectedURL = nil
+                        do {
+                            let bookmark = try url.bookmarkData(
+                                options: .withSecurityScope,
+                                includingResourceValuesForKeys: nil,
+                                relativeTo: nil
+                            )
+                            taskManager.addRule(name: newFolderName, keywords: [newFolderName], bookmark: bookmark)
+                            newFolderName = ""; selectedURL = nil; addRuleError = nil
+                        } catch {
+                            addRuleError = "북마크 생성 실패: \(error.localizedDescription)"
+                        }
                     }
                 }.buttonStyle(.borderedProminent).disabled(newFolderName.isEmpty || selectedURL == nil)
             }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
