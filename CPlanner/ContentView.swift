@@ -13,8 +13,8 @@ import os
 private let taskManagerLogger = Logger(subsystem: "com.cplanner", category: "TaskManager")
 
 // --- 1. 모델 정의 ---
-struct TaskItem: Identifiable {
-    let id = UUID()
+struct TaskItem: Identifiable, Codable {
+    var id = UUID()
     var title: String
     var isCompleted: Bool = false
     var targetFolder: String
@@ -45,18 +45,50 @@ struct FolderRule: Identifiable, Codable {
 
 // --- 2. 메인 매니저 ---
 class TaskManager: ObservableObject {
-    @Published var tasks: [TaskItem] = []
-    @Published var folderRules: [FolderRule] = []
+    private static let tasksKey = "cplanner.tasks"
+    private static let folderRulesKey = "cplanner.folderRules"
+
+    @Published var tasks: [TaskItem] = [] {
+        didSet { persist(tasks, forKey: Self.tasksKey) }
+    }
+    @Published var folderRules: [FolderRule] = [] {
+        didSet { persist(folderRules, forKey: Self.folderRulesKey) }
+    }
     @Published var lastCalendarError: String?
 
     private let eventStore = EKEventStore()
     private var monitors: [UUID: (monitor: FolderMonitor, scopedURL: URL)] = [:]
     private var calendarAccessGranted = false
 
+    init() {
+        // Load persisted state. didSet observers do NOT fire during init,
+        // so these assignments don't write back to UserDefaults.
+        if let data = UserDefaults.standard.data(forKey: Self.tasksKey),
+           let decoded = try? JSONDecoder().decode([TaskItem].self, from: data) {
+            self.tasks = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: Self.folderRulesKey),
+           let decoded = try? JSONDecoder().decode([FolderRule].self, from: data) {
+            self.folderRules = decoded
+            for rule in self.folderRules {
+                startMonitoring(rule: rule)
+            }
+        }
+    }
+
     deinit {
         for entry in monitors.values {
             entry.monitor.stopMonitoring()
             entry.scopedURL.stopAccessingSecurityScopedResource()
+        }
+    }
+
+    private func persist<T: Encodable>(_ value: T, forKey key: String) {
+        do {
+            let data = try JSONEncoder().encode(value)
+            UserDefaults.standard.set(data, forKey: key)
+        } catch {
+            taskManagerLogger.error("Failed to persist \(key, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
     }
 
