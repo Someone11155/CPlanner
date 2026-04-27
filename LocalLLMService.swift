@@ -31,6 +31,7 @@ class LocalLLMService {
             
             let configML = MLModelConfiguration()
             configML.computeUnits = .all
+            configML.allowLowPrecisionAccumulationOnGPU = true
             
             let modelName = "StatefulMistral7BInstructInt4"
             if let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") {
@@ -68,6 +69,8 @@ class LocalLLMService {
         }
         
         print("🤖 [Mistral 7B] '\(taskTitle)' 분류 시작!")
+        print("📋 모델 입력 정보: \(model.modelDescription.inputDescriptionsByName.keys)")
+        print("📋 모델 출력 정보: \(model.modelDescription.outputDescriptionsByName.keys)")
         
         var optionsText = ""
         let labels = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
@@ -77,78 +80,59 @@ class LocalLLMService {
             }
         }
         
-        let prompt = """
-        <s>[INST] You are a category sorter. Reply with EXACTLY ONE letter from the Categories list.
-        
-        Categories:
-        A. 운동
-        B. 공부
-        Task: 헬스장 가기 [/INST]A</s>[INST] Categories:
-        \(optionsText)
-        Task: \(taskTitle) [/INST]
-        """
+        // <s>[INST] 형식과 명확한 지시사항, 그리고 마지막에 공백 한 칸을 추가하여 AI가 바로 답변을 시작하도록 유도합니다.
+        let prompt = "<s>[INST] You are a category sorter. Reply with EXACTLY ONE letter from the Categories list.\n\nCategories:\n\(optionsText)\nTask: \(taskTitle) [/INST] "
         
         let inputTokens = tokenizer.encode(text: prompt)
         let seqLen = inputTokens.count
         print("🔢 프롬프트 길이: \(seqLen) 토큰")
         
         do {
-            let inputIdsArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
+            // "Cannot retrieve vector from IRValue format int32" 에러가 발생하면 
+            // 모델이 Int64(long)를 기대하는 것일 수 있으므로 로그를 보고 타입을 조정해야 할 수 있습니다.
+            let inputIdsArray = try MLMultiArray(shape: [1, 1], dataType: .int32) 
             let causalMaskArray = try MLMultiArray(shape: [1, 1, 1, 1], dataType: .float16)
             causalMaskArray[0] = 0.0
             
             let state = model.makeState()
             var finalLogits: MLMultiArray?
             
-            print("⏳ NPU 가동! 질문을 친구에게 던지는 중...")
+            print("⏳ NPU 가동! 추론 중...")
             
             for i in 0..<seqLen {
                 inputIdsArray[0] = NSNumber(value: inputTokens[i])
                 let inputs: [String: Any] = ["inputIds": inputIdsArray, "causalMask": causalMaskArray]
                 let provider = try MLDictionaryFeatureProvider(dictionary: inputs)
-                let prediction = try runPredictionSync(model: model, provider: provider, state: state)
+                let prediction = try await model.prediction(from: provider, using: state)
                 
                 if i == seqLen - 1 {
                     finalLogits = prediction.featureValue(for: "logits")?.multiArrayValue
                 }
-                
-                if i % 10 == 0 {
-                    await Task.yield()
-                }
             }
             
-            print("🧠 친구의 생각 분석 중...")
-            
             if let logits = finalLogits {
-                let topTokens = getTopK(from: logits, k: 30)
+                let topTokens = getTopK(from: logits, k: 10)
+                print("🧠 AI가 생성한 상위 토큰들:")
                 
                 for token in topTokens {
                     let decodedWord = tokenizer.decode(tokens: [token])
+                    // 앞뒤 공백 제거 및 대문자 변환
+                    let cleanWord = decodedWord.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                    print("  - [\(token)]: \"\(decodedWord)\" -> 처리됨: \"\(cleanWord)\"")
                     
-                    // 🔥 방어막 1: 아예 특수 토큰(</s>, <bbox> 등) 문자열이 껴있으면 분석하기도 전에 버립니다!
-                    if decodedWord.contains("<") || decodedWord.contains(">") { continue }
-                    
-                    let upperWord = decodedWord.uppercased()
-                    let lettersOnly = upperWord.filter { "ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains($0) }
-                    
-                    if lettersOnly.count == 1 {
-                        let cleanLetter = String(lettersOnly)
-                        
-                        // 🔥 방어막 2: 뽑아낸 글자가 진짜 보기 배열(A, B, C...) 안에 존재하는지 검사!
-                        if labels.contains(cleanLetter) {
-                            print("🎯 AI의 속마음에서 정답 알파벳을 찾아냈어: [\(cleanLetter)]")
-                            
-                            if let index = labels.firstIndex(of: cleanLetter), index < availableFolders.count {
-                                let matchedFolder = availableFolders[index]
-                                print("✅ 최종 폴더 배정 완료: \(matchedFolder)")
-                                return matchedFolder
-                            }
-                            break
+                    // A~J 중 하나만 포함된 답변을 찾습니다.
+                    if cleanWord.count == 1, let char = cleanWord.first, "ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(char) {
+                        let letter = String(char)
+                        if let index = labels.firstIndex(of: letter), index < availableFolders.count {
+                            let matchedFolder = availableFolders[index]
+                            print("🎯 매칭 성공: \(letter) -> \(matchedFolder)")
+                            return matchedFolder
                         }
                     }
                 }
             }
             
+            print("🤔 적절한 카테고리를 찾지 못했습니다. '일반'으로 분류합니다.")
             return "일반"
             
         } catch {

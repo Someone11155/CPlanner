@@ -1,0 +1,21 @@
+# Xcode
+build/
+DerivedData/
+*.moved-aside
+*.xcuserstate
+*.xcuserdata
+project.xcworkspace/xcuserdata
+project.xcworkspace/xcshareddata/swiftpm/configuration
+CPlanner.xcodeproj/xcuserdata/
+
+# OS X
+.DS_Store
+
+# Temporary / Sensitive Files (detected in this project)
+--openai-api-key
+sk-lm-*
+heh
+hi
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/
