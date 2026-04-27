@@ -7,40 +7,53 @@
 
 import Foundation
 import Combine
+import os
+
+private let folderMonitorLogger = Logger(subsystem: "com.cplanner", category: "FolderMonitor")
 
 class FolderMonitor: ObservableObject {
-    private var folderURL: URL
+    private let folderURL: URL
     private var dispatchSource: DispatchSourceFileSystemObject?
-    
+
     var folderDidChange: (() -> Void)?
-    
+
     init(url: URL) {
         self.folderURL = url
     }
-    
+
+    deinit {
+        dispatchSource?.cancel()
+    }
+
     func startMonitoring() {
+        guard dispatchSource == nil else { return }
+
         let fileDescriptor = open(folderURL.path, O_EVTONLY)
-        guard fileDescriptor != -1 else { return }
-        
-        dispatchSource = DispatchSource.makeFileSystemObjectSource(
+        guard fileDescriptor != -1 else {
+            folderMonitorLogger.error("Failed to open folder for monitoring: \(self.folderURL.path, privacy: .public)")
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fileDescriptor,
             eventMask: .write,
             queue: DispatchQueue.global(qos: .background)
         )
-        
-        dispatchSource?.setEventHandler { [weak self] in
-            DispatchQueue.main.async {
+
+        source.setEventHandler { [weak self] in
+            DispatchQueue.main.async { [weak self] in
                 self?.folderDidChange?()
             }
         }
-        
-        dispatchSource?.setCancelHandler {
+
+        source.setCancelHandler {
             close(fileDescriptor)
         }
-        
-        dispatchSource?.resume()
+
+        dispatchSource = source
+        source.resume()
     }
-    
+
     func stopMonitoring() {
         dispatchSource?.cancel()
         dispatchSource = nil
