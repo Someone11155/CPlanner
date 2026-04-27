@@ -11,11 +11,7 @@ CPlanner.xcodeproj/xcuserdata/
 # OS X
 .DS_Store
 
-# Temporary / Sensitive Files (detected in this project)
---openai-api-key
-sk-lm-*
-heh
-hi
-.aider.chat.history.md
-.aider.input.history
-.aider.tags.cache.v4/
+# Temporary / Sensitive Files
+--*
+sk-*
+.aider*
