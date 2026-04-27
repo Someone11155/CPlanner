@@ -17,9 +17,7 @@ struct CplannerApp: App {
     
     var body: some Scene {
         WindowGroup {
-            // 원래 있던 ContentView() 대신 우리가 만든 테스트 화면을 띄웁니다!
-            // (나중에 테스트가 끝나면 다시 ContentView()로 돌려놓으시면 됩니다.)
-            NLPTestView()
+            ContentView()
         }
     }
 }
