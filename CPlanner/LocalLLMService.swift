@@ -42,6 +42,14 @@ actor LocalLLMService {
         ensureLoadTaskStarted()
     }
 
+    /// 모델 파일이 새로 설치된 직후 다시 로드하기 위한 리셋.
+    func reload() {
+        loadTask = nil
+        tokenizer = nil
+        monoModel = nil
+        ensureLoadTaskStarted()
+    }
+
     private func ensureLoadTaskStarted() {
         if loadTask == nil {
             loadTask = Task { [weak self] in
@@ -57,21 +65,18 @@ actor LocalLLMService {
 
     private func setupMistral() async {
         llmLogger.info("[Mistral 7B] 모델 로딩 시작")
+        let location = await MainActor.run { ModelInstaller.shared.resolveModelLocation() }
+        guard let location else {
+            llmLogger.warning("모델/토크나이저가 설치되지 않음 — classifyTask는 '일반'을 반환")
+            return
+        }
         do {
-            guard let resourceURL = Bundle.main.resourceURL else {
-                llmLogger.error("Bundle.main.resourceURL is nil")
-                return
-            }
-            self.tokenizer = try await AutoTokenizer.from(modelFolder: resourceURL)
+            self.tokenizer = try await AutoTokenizer.from(modelFolder: location)
 
             let configML = MLModelConfiguration()
             configML.computeUnits = .all
 
-            let modelName = "StatefulMistral7BInstructInt4"
-            guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") else {
-                llmLogger.error("모델 파일을 찾을 수 없습니다 (mlmodelc).")
-                return
-            }
+            let modelURL = location.appendingPathComponent("StatefulMistral7BInstructInt4.mlmodelc")
             self.monoModel = try MLModel(contentsOf: modelURL, configuration: configML)
             llmLogger.info("[Mistral 7B] 로딩 완료")
         } catch {
@@ -79,7 +84,7 @@ actor LocalLLMService {
         }
     }
 
-    func classifyTask(taskTitle: String, availableFolders: [String]) async -> String {
+    func classifyTask(taskTitle: String, availableFolders: [String], corrections: [Correction] = []) async -> String {
         await ensureLoaded()
         guard let tokenizer = self.tokenizer, let model = self.monoModel else {
             return "일반"
@@ -87,12 +92,7 @@ actor LocalLLMService {
 
         // Strip Mistral instruct delimiters from the user-supplied title
         // so a malicious task name cannot break out of the prompt.
-        let sanitizedTitle = taskTitle
-            .replacingOccurrences(of: "[INST]", with: "")
-            .replacingOccurrences(of: "[/INST]", with: "")
-            .replacingOccurrences(of: "<s>", with: "")
-            .replacingOccurrences(of: "</s>", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let sanitizedTitle = sanitize(taskTitle)
 
         let usableFolders = Array(availableFolders.prefix(classificationLabelAlphabet.count))
         if availableFolders.count > usableFolders.count {
@@ -107,13 +107,22 @@ actor LocalLLMService {
             optionsText += "\(labels[i]). \(folder)\n"
         }
 
-        // Mistral Instruct v3 포맷
+        // 사용자 수정 이력을 few-shot 예시로 누적 — 같은 카테고리 옵션 + 정답 라벨 형태
+        var fewShotExamples = ""
+        for c in corrections {
+            guard let folderIdx = usableFolders.firstIndex(of: c.folderName) else { continue }
+            let label = labels[folderIdx]
+            let safeTitle = sanitize(c.taskTitle)
+            fewShotExamples += "[INST] 카테고리:\n\(optionsText)할 일: \(safeTitle) [/INST] \(label) </s> "
+        }
+
+        // Mistral Instruct v3 포맷 — 정적 예시 + 사용자 수정 예시 + 실제 분류 턴
         let prompt = """
         [INST] 분류 전문가로서 할 일을 카테고리 중 하나로 분류하세요. 대문자 알파벳 한 글자만 답하세요.
         카테고리:
         A. 운동
         B. 공부
-        할 일: 헬스장 가기 [/INST] A </s> [INST] 카테고리:
+        할 일: 헬스장 가기 [/INST] A </s> \(fewShotExamples)[INST] 카테고리:
         \(optionsText)
         할 일: \(sanitizedTitle) [/INST]
         """
@@ -125,17 +134,19 @@ actor LocalLLMService {
             var finalLogits: MLMultiArray?
 
             for (i, tokenID) in inputTokens.enumerated() {
-                let inputIds = MLShapedArray<Int32>(scalars: [Int32(tokenID)], shape: [1, 1])
-                // causalMask의 마지막 축(key length)은 KV cache 누적 위치(i+1)와 일치해야 한다.
-                // 모든 위치는 0.0으로 마스크되지 않음 — 단일 query 토큰이 자신을 포함한
-                // 이전 모든 토큰을 attend.
+                // inputIds: int32 [1, 1]
+                let inputIdsMA = try MLMultiArray(shape: [1, 1], dataType: .int32)
+                inputIdsMA[0] = NSNumber(value: Int32(tokenID))
+
+                // causalMask: fp16 [1, 1, 1, keyLen], 모든 위치 0 (마스크 없음)
                 let keyLen = i + 1
-                let maskValues = [Float16](repeating: 0.0, count: keyLen)
-                let causalMask = MLShapedArray<Float16>(scalars: maskValues, shape: [1, 1, 1, keyLen])
+                let maskMA = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: keyLen)], dataType: .float16)
+                let maskBytes = maskMA.dataPointer.bindMemory(to: UInt16.self, capacity: keyLen)
+                for j in 0..<keyLen { maskBytes[j] = 0 } // fp16 zero == 0x0000
 
                 let inputs: [String: Any] = [
-                    "inputIds": MLMultiArray(inputIds),
-                    "causalMask": MLMultiArray(causalMask)
+                    "inputIds": inputIdsMA,
+                    "causalMask": maskMA
                 ]
 
                 let provider = try MLDictionaryFeatureProvider(dictionary: inputs)
@@ -176,6 +187,15 @@ actor LocalLLMService {
         }
         topTokens.sort { $0.score > $1.score }
         return topTokens.prefix(k).map { $0.index }
+    }
+
+    private func sanitize(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "[INST]", with: "")
+            .replacingOccurrences(of: "[/INST]", with: "")
+            .replacingOccurrences(of: "<s>", with: "")
+            .replacingOccurrences(of: "</s>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     nonisolated func validateFileContext(fileName: String, folderName: String) -> Bool {

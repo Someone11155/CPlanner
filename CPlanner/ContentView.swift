@@ -22,6 +22,11 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var eventIdentifier: String? = nil
 }
 
+struct Correction: Codable, Equatable, Sendable {
+    var taskTitle: String
+    var folderName: String
+}
+
 struct FolderRule: Identifiable, Codable {
     var id = UUID()
     var folderName: String
@@ -47,12 +52,16 @@ struct FolderRule: Identifiable, Codable {
 class TaskManager: ObservableObject {
     private static let tasksKey = "cplanner.tasks"
     private static let folderRulesKey = "cplanner.folderRules"
+    private static let correctionsKey = "cplanner.corrections"
 
     @Published var tasks: [TaskItem] = [] {
         didSet { persist(tasks, forKey: Self.tasksKey) }
     }
     @Published var folderRules: [FolderRule] = [] {
         didSet { persist(folderRules, forKey: Self.folderRulesKey) }
+    }
+    @Published var corrections: [Correction] = [] {
+        didSet { persist(corrections, forKey: Self.correctionsKey) }
     }
     @Published var lastCalendarError: String?
 
@@ -76,6 +85,10 @@ class TaskManager: ObservableObject {
             for rule in self.folderRules {
                 startMonitoring(rule: rule)
             }
+        }
+        if let data = UserDefaults.standard.data(forKey: Self.correctionsKey),
+           let decoded = try? JSONDecoder().decode([Correction].self, from: data) {
+            self.corrections = decoded
         }
         Task { [weak self] in
             await self?.bootstrapCalendar()
@@ -102,11 +115,21 @@ class TaskManager: ObservableObject {
 
     // 할 일 추가 (AI 분류 적용)
     func addTask(title: String, date: Date) {
+        // 1) 즉시 placeholder 폴더로 UI 반영
+        let placeholder = TaskItem(title: title, targetFolder: "분류 중…", date: date)
+        let taskID = placeholder.id
+        tasks.append(placeholder)
+
+        // 2) 백그라운드: 분류 + 캘린더 저장 + task 갱신
+        let folderNames = self.folderRules.map { $0.folderName }
+        let activeCorrections = Array(self.corrections.filter { folderNames.contains($0.folderName) }.suffix(5))
         Task { [weak self] in
             guard let self else { return }
-            let folders = self.folderRules.map { $0.folderName }
-            let detectedFolder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folders)
-            var newTask = TaskItem(title: title, targetFolder: detectedFolder, date: date)
+            let detectedFolder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folderNames, corrections: activeCorrections)
+            if let idx = self.tasks.firstIndex(where: { $0.id == taskID }), self.tasks[idx].targetFolder == "분류 중…" {
+                // 사용자가 그동안 폴더를 직접 골랐으면 자동 분류 결과로 덮어쓰지 않음
+                self.tasks[idx].targetFolder = detectedFolder
+            }
 
             if self.calendarAccessGranted, let cal = self.cplannerCalendar {
                 let event = EKEvent(eventStore: self.eventStore)
@@ -115,12 +138,15 @@ class TaskManager: ObservableObject {
                 event.startDate = day
                 event.endDate = day
                 event.isAllDay = true
+                event.alarms = [] // 캘린더 source의 기본 alarm이 URL을 포함해 sandbox 경고 발생 — 명시적 클리어
                 event.calendar = cal
 
                 self.isApplyingLocalChange = true
                 do {
                     try self.eventStore.save(event, span: .thisEvent)
-                    newTask.eventIdentifier = event.eventIdentifier
+                    if let idx = self.tasks.firstIndex(where: { $0.id == taskID }) {
+                        self.tasks[idx].eventIdentifier = event.eventIdentifier
+                    }
                     self.lastCalendarError = nil
                 } catch {
                     self.lastCalendarError = "캘린더 저장 실패: \(error.localizedDescription)"
@@ -128,8 +154,20 @@ class TaskManager: ObservableObject {
                 }
                 DispatchQueue.main.async { [weak self] in self?.isApplyingLocalChange = false }
             }
+        }
+    }
 
-            self.tasks.append(newTask)
+    /// 사용자가 직접 폴더를 변경 — task에 반영 + 같은 제목의 기존 correction 대체 후 추가.
+    /// 다음 분류부터 in-context few-shot 예시로 사용된다.
+    func userPickedFolder(taskID: UUID, folder: String) {
+        guard let idx = tasks.firstIndex(where: { $0.id == taskID }) else { return }
+        tasks[idx].targetFolder = folder
+        let title = tasks[idx].title
+        corrections.removeAll { $0.taskTitle == title }
+        corrections.append(Correction(taskTitle: title, folderName: folder))
+        // 무한 누적 방지
+        if corrections.count > 50 {
+            corrections.removeFirst(corrections.count - 50)
         }
     }
 
@@ -427,6 +465,7 @@ struct CustomCalendarView: View {
 // --- 4. 메인 UI 화면 ---
 struct ContentView: View {
     @StateObject private var taskManager = TaskManager()
+    @StateObject private var modelInstaller = ModelInstaller.shared
     @State private var selectedDate = Date()
     @State private var isAddingTask = false
     @State private var showSettings = false
@@ -481,9 +520,24 @@ struct ContentView: View {
                                 Image(systemName: taskManager.tasks[index].isCompleted ? "checkmark.circle.fill" : "circle")
                                     .foregroundColor(taskManager.tasks[index].isCompleted ? .blue : .gray).font(.title3)
                                     .onTapGesture { taskManager.tasks[index].isCompleted.toggle() }
-                                VStack(alignment: .leading) {
+                                VStack(alignment: .leading, spacing: 2) {
                                     Text(task.title).strikethrough(taskManager.tasks[index].isCompleted).foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary).font(.headline)
-                                    Text("📁 자동 분류됨: \(task.targetFolder)").font(.caption).foregroundColor(.secondary)
+                                    Menu {
+                                        ForEach(taskManager.folderRules) { rule in
+                                            Button(rule.folderName) { taskManager.userPickedFolder(taskID: task.id, folder: rule.folderName) }
+                                        }
+                                        if taskManager.folderRules.isEmpty {
+                                            Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.secondary)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Text("📁 자동 분류됨: \(task.targetFolder)")
+                                            Image(systemName: "chevron.down").font(.caption2)
+                                        }.font(.caption).foregroundColor(.secondary)
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .menuIndicator(.hidden)
+                                    .fixedSize()
                                 }
                                 Spacer()
                             }
@@ -496,6 +550,74 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(NSColor.textBackgroundColor))
         }
         .sheet(isPresented: $showSettings) { SettingsView(taskManager: taskManager) }
+        .alert("Mistral 모델 다운로드 필요", isPresented: needsDownloadBinding) {
+            Button("다운로드 (~ 4 GB)") { modelInstaller.startDownload() }
+            Button("나중에", role: .cancel) { modelInstaller.skip() }
+        } message: {
+            Text("Mistral 7B 모델과 토크나이저가 설치돼 있지 않아 폴더 자동 분류가 비활성 상태입니다.\nHuggingFace에서 받으시겠습니까?")
+        }
+        .sheet(isPresented: isDownloadingBinding) {
+            DownloadProgressView().interactiveDismissDisabled()
+        }
+        .alert("다운로드 실패", isPresented: hasFailureBinding) {
+            Button("재시도") { modelInstaller.startDownload() }
+            Button("닫기", role: .cancel) { modelInstaller.skip() }
+        } message: {
+            Text(failureMessage)
+        }
+    }
+
+    private var needsDownloadBinding: Binding<Bool> {
+        Binding(
+            get: { if case .needsDownload = modelInstaller.state { return true }; return false },
+            set: { _ in }
+        )
+    }
+    private var isDownloadingBinding: Binding<Bool> {
+        Binding(
+            get: {
+                switch modelInstaller.state {
+                case .downloading, .compiling: return true
+                default: return false
+                }
+            },
+            set: { _ in }
+        )
+    }
+    private var hasFailureBinding: Binding<Bool> {
+        Binding(
+            get: { if case .failed = modelInstaller.state { return true }; return false },
+            set: { _ in }
+        )
+    }
+    private var failureMessage: String {
+        if case .failed(let msg) = modelInstaller.state { return msg }
+        return ""
+    }
+}
+
+// --- 4-1. 모델 다운로드/컴파일 진행 시트 ---
+struct DownloadProgressView: View {
+    @ObservedObject private var installer = ModelInstaller.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            switch installer.state {
+            case .downloading(let progress, let status):
+                Text("Mistral 모델 다운로드 중").font(.title2).fontWeight(.bold)
+                ProgressView(value: progress).progressViewStyle(.linear)
+                Text(status).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                Text("\(Int(progress * 100))% — 창을 닫지 마세요.").font(.caption2).foregroundColor(.secondary)
+            case .compiling:
+                Text("모델 컴파일 중").font(.title2).fontWeight(.bold)
+                ProgressView().progressViewStyle(.linear)
+                Text("CoreML이 .mlpackage를 .mlmodelc로 컴파일하고 있습니다 (수십 초~수 분 소요).").font(.caption).foregroundColor(.secondary)
+            default:
+                ProgressView().progressViewStyle(.linear)
+            }
+        }
+        .padding(24)
+        .frame(width: 480)
     }
 }
 
