@@ -11,13 +11,17 @@ import Tokenizers
 import Hub
 import os
 
-private let llmLogger = Logger(subsystem: "com.cplanner", category: "LocalLLMService")
+// MLModel is an ObjC class not yet annotated as Sendable in the CoreML SDK.
+// All access is serialised through LocalLLMService (an actor), so this is safe.
+extension MLModel: @retroactive @unchecked Sendable {}
+
+nonisolated(unsafe) private let llmLogger = Logger(subsystem: "com.cplanner", category: "LocalLLMService")
 
 /// Single uppercase letters A–Z used as classification targets.
 /// 26 folders is more than enough in practice; if a user defines more
 /// than 26, the trailing folders are silently unreachable from the
 /// classifier and we log a warning.
-private let classificationLabelAlphabet: [String] =
+nonisolated(unsafe) private let classificationLabelAlphabet: [String] =
     (0..<26).map { i in String(UnicodeScalar(UInt8(0x41 + i))) }
 
 @available(macOS 15.0, iOS 18.0, *)
@@ -122,7 +126,12 @@ actor LocalLLMService {
 
             for (i, tokenID) in inputTokens.enumerated() {
                 let inputIds = MLShapedArray<Int32>(scalars: [Int32(tokenID)], shape: [1, 1])
-                let causalMask = MLShapedArray<Float16>(scalars: [0.0], shape: [1, 1, 1, 1])
+                // causalMask의 마지막 축(key length)은 KV cache 누적 위치(i+1)와 일치해야 한다.
+                // 모든 위치는 0.0으로 마스크되지 않음 — 단일 query 토큰이 자신을 포함한
+                // 이전 모든 토큰을 attend.
+                let keyLen = i + 1
+                let maskValues = [Float16](repeating: 0.0, count: keyLen)
+                let causalMask = MLShapedArray<Float16>(scalars: maskValues, shape: [1, 1, 1, keyLen])
 
                 let inputs: [String: Any] = [
                     "inputIds": MLMultiArray(inputIds),

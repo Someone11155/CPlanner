@@ -13,12 +13,13 @@ import os
 private let taskManagerLogger = Logger(subsystem: "com.cplanner", category: "TaskManager")
 
 // --- 1. 모델 정의 ---
-struct TaskItem: Identifiable, Codable {
+struct TaskItem: Identifiable, Codable, Equatable {
     var id = UUID()
     var title: String
     var isCompleted: Bool = false
     var targetFolder: String
     var date: Date
+    var eventIdentifier: String? = nil
 }
 
 struct FolderRule: Identifiable, Codable {
@@ -58,6 +59,9 @@ class TaskManager: ObservableObject {
     private let eventStore = EKEventStore()
     private var monitors: [UUID: (monitor: FolderMonitor, scopedURL: URL)] = [:]
     private var calendarAccessGranted = false
+    private var cplannerCalendar: EKCalendar?
+    private var isApplyingLocalChange = false
+    nonisolated(unsafe) private var calendarChangeObserver: NSObjectProtocol?
 
     init() {
         // Load persisted state. didSet observers do NOT fire during init,
@@ -73,11 +77,16 @@ class TaskManager: ObservableObject {
                 startMonitoring(rule: rule)
             }
         }
+        Task { [weak self] in
+            await self?.bootstrapCalendar()
+        }
     }
 
     deinit {
+        if let observer = calendarChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         for entry in monitors.values {
-            entry.monitor.stopMonitoring()
             entry.scopedURL.stopAccessingSecurityScopedResource()
         }
     }
@@ -97,13 +106,49 @@ class TaskManager: ObservableObject {
             guard let self else { return }
             let folders = self.folderRules.map { $0.folderName }
             let detectedFolder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folders)
-            let newTask = TaskItem(title: title, targetFolder: detectedFolder, date: date)
+            var newTask = TaskItem(title: title, targetFolder: detectedFolder, date: date)
+
+            if self.calendarAccessGranted, let cal = self.cplannerCalendar {
+                let event = EKEvent(eventStore: self.eventStore)
+                event.title = title
+                let day = Calendar.current.startOfDay(for: date)
+                event.startDate = day
+                event.endDate = day
+                event.isAllDay = true
+                event.calendar = cal
+
+                self.isApplyingLocalChange = true
+                do {
+                    try self.eventStore.save(event, span: .thisEvent)
+                    newTask.eventIdentifier = event.eventIdentifier
+                    self.lastCalendarError = nil
+                } catch {
+                    self.lastCalendarError = "캘린더 저장 실패: \(error.localizedDescription)"
+                    taskManagerLogger.error("Calendar save failed: \(error.localizedDescription, privacy: .public)")
+                }
+                DispatchQueue.main.async { [weak self] in self?.isApplyingLocalChange = false }
+            }
+
             self.tasks.append(newTask)
-            await self.saveToMacCalendar(title: title, date: date)
         }
     }
 
-    func deleteTask(id: UUID) { tasks.removeAll { $0.id == id } }
+    func deleteTask(id: UUID) {
+        guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let task = tasks[idx]
+        if let eid = task.eventIdentifier,
+           calendarAccessGranted,
+           let event = eventStore.event(withIdentifier: eid) {
+            isApplyingLocalChange = true
+            do {
+                try eventStore.remove(event, span: .thisEvent)
+            } catch {
+                taskManagerLogger.error("Calendar delete failed: \(error.localizedDescription, privacy: .public)")
+            }
+            DispatchQueue.main.async { [weak self] in self?.isApplyingLocalChange = false }
+        }
+        tasks.remove(at: idx)
+    }
 
     // 감시 규칙 추가
     func addRule(name: String, bookmark: Data) {
@@ -179,38 +224,114 @@ class TaskManager: ObservableObject {
         }
     }
 
-    private func saveToMacCalendar(title: String, date: Date) async {
+    private func bootstrapCalendar() async {
         do {
-            if !calendarAccessGranted {
-                let granted: Bool
-                if #available(macOS 14, *) {
-                    granted = try await eventStore.requestFullAccessToEvents()
-                } else {
-                    granted = try await eventStore.requestAccess(to: .event)
-                }
-                calendarAccessGranted = granted
-                guard granted else {
-                    lastCalendarError = "캘린더 접근 권한이 거부되었습니다."
-                    return
-                }
-            }
-
-            guard let calendar = eventStore.defaultCalendarForNewEvents else {
-                lastCalendarError = "기본 캘린더를 찾을 수 없습니다."
+            let granted = try await eventStore.requestFullAccessToEvents()
+            calendarAccessGranted = granted
+            guard granted else {
+                lastCalendarError = "캘린더 접근 권한이 거부되었습니다."
                 return
             }
-
-            let event = EKEvent(eventStore: eventStore)
-            event.title = "[Cplanner] \(title)"
-            event.startDate = date
-            event.endDate = date
-            event.isAllDay = true
-            event.calendar = calendar
-            try eventStore.save(event, span: .thisEvent)
-            lastCalendarError = nil
+            guard let cal = getOrCreateCPlannerCalendar() else { return }
+            cplannerCalendar = cal
+            subscribeToCalendarChanges()
+            await syncFromCalendar()
         } catch {
-            lastCalendarError = "캘린더 저장 실패: \(error.localizedDescription)"
-            taskManagerLogger.error("Calendar save failed: \(error.localizedDescription, privacy: .public)")
+            lastCalendarError = "캘린더 권한 요청 실패: \(error.localizedDescription)"
+            taskManagerLogger.error("Calendar access request failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func getOrCreateCPlannerCalendar() -> EKCalendar? {
+        if let existing = eventStore.calendars(for: .event).first(where: { $0.title == "CPlanner" }) {
+            return existing
+        }
+        let source: EKSource? = eventStore.sources.first(where: { $0.sourceType == .calDAV })
+            ?? eventStore.sources.first(where: { $0.sourceType == .local })
+        guard let source else {
+            lastCalendarError = "캘린더 source를 찾을 수 없습니다."
+            taskManagerLogger.error("No suitable EKSource for CPlanner calendar")
+            return nil
+        }
+        let cal = EKCalendar(for: .event, eventStore: eventStore)
+        cal.title = "CPlanner"
+        cal.source = source
+        cal.cgColor = NSColor.systemBlue.cgColor
+        do {
+            try eventStore.saveCalendar(cal, commit: true)
+            return cal
+        } catch {
+            lastCalendarError = "CPlanner 캘린더 생성 실패: \(error.localizedDescription)"
+            taskManagerLogger.error("Failed to create CPlanner calendar: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    private func subscribeToCalendarChanges() {
+        calendarChangeObserver = NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged,
+            object: eventStore,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.isApplyingLocalChange { return }
+                await self.syncFromCalendar()
+            }
+        }
+    }
+
+    private func syncFromCalendar() async {
+        guard calendarAccessGranted, let cal = cplannerCalendar else { return }
+        let calendar = Calendar.current
+        let now = Date()
+        let start = calendar.date(byAdding: .month, value: -6, to: now) ?? now
+        let end = calendar.date(byAdding: .month, value: 24, to: now) ?? now
+        let predicate = eventStore.predicateForEvents(withStart: start, end: end, calendars: [cal])
+        let events = eventStore.events(matching: predicate)
+
+        var resultTasks = tasks
+        var seenEventIds = Set<String>()
+        var taskIdxByEventId: [String: Int] = [:]
+        for (i, t) in resultTasks.enumerated() {
+            if let eid = t.eventIdentifier { taskIdxByEventId[eid] = i }
+        }
+
+        for event in events {
+            guard !event.hasRecurrenceRules else {
+                taskManagerLogger.warning("Skipping recurring event: \(event.title ?? "(제목 없음)", privacy: .public)")
+                continue
+            }
+            guard let eid = event.eventIdentifier else { continue }
+            seenEventIds.insert(eid)
+            let normalizedDate = calendar.startOfDay(for: event.startDate)
+            let title = event.title ?? "(제목 없음)"
+
+            if let idx = taskIdxByEventId[eid] {
+                if resultTasks[idx].title != title { resultTasks[idx].title = title }
+                if !calendar.isDate(resultTasks[idx].date, inSameDayAs: normalizedDate) {
+                    resultTasks[idx].date = normalizedDate
+                }
+            } else {
+                let folder: String
+                if folderRules.count >= 2 {
+                    let names = folderRules.map { $0.folderName }
+                    folder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: names)
+                } else {
+                    folder = "(미분류)"
+                }
+                let newTask = TaskItem(title: title, targetFolder: folder, date: normalizedDate, eventIdentifier: eid)
+                resultTasks.append(newTask)
+            }
+        }
+
+        resultTasks.removeAll { task in
+            guard let eid = task.eventIdentifier else { return false }
+            return !seenEventIds.contains(eid)
+        }
+
+        if resultTasks != tasks {
+            tasks = resultTasks
         }
     }
 }
