@@ -493,19 +493,19 @@ struct TipBar: View {
     private let timer = Timer.publish(every: 7, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: DesignSpacing.xs) {
             Text("💡")
             Text(currentTip)
-                .font(.caption)
-                .foregroundColor(.secondary)
+                .font(DesignFont.bodySmall())
+                .foregroundColor(.notionSlateAdaptive)
                 .id(currentTip)
                 .transition(.opacity)
             Spacer()
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.horizontal, DesignSpacing.md)
+        .padding(.vertical, DesignSpacing.xs)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Color.notionSurfaceAdaptive)
         .onReceive(timer) { _ in
             guard TipBar.tips.count > 1 else { return }
             var next = TipBar.tips.randomElement() ?? currentTip
@@ -540,11 +540,27 @@ struct ContentView: View {
             // 우측 할 일 목록
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록").font(.title).fontWeight(.heavy)
+                    Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록")
+                        .font(DesignFont.heading1())
+                        .foregroundColor(.notionInkAdaptive)
                     Spacer()
-                    Button(action: { showSettings.toggle() }) { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.secondary) }.buttonStyle(.plain).padding(.trailing, 10)
-                    Button(action: { withAnimation { isAddingTask.toggle() } }) { Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill").font(.title).foregroundColor(isAddingTask ? .gray : .blue) }.buttonStyle(.plain)
-                }.padding(.horizontal).padding(.top, 25).padding(.bottom, 15)
+                    Button(action: { showSettings.toggle() }) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.title2)
+                            .foregroundColor(.notionSlateAdaptive)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, DesignSpacing.sm)
+                    Button(action: { withAnimation { isAddingTask.toggle() } }) {
+                        Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill")
+                            .font(.title)
+                            .foregroundColor(isAddingTask ? .notionStone : .notionPurple)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, DesignSpacing.md)
+                .padding(.top, DesignSpacing.lg)
+                .padding(.bottom, DesignSpacing.md)
 
                 if let calendarError = taskManager.lastCalendarError {
                     Text("⚠️ \(calendarError)")
@@ -555,63 +571,73 @@ struct ContentView: View {
                 }
 
                 if isAddingTask {
-                    VStack(spacing: 12) {
+                    VStack(spacing: DesignSpacing.sm) {
                         TextField("할 일 제목 (예: 운영체제 과제)", text: $newTaskTitle)
                             .textFieldStyle(.roundedBorder)
+                            .font(DesignFont.body())
                             .onSubmit {
                                 if !newTaskTitle.isEmpty { taskManager.addTask(title: newTaskTitle, date: selectedDate); newTaskTitle = ""; withAnimation { isAddingTask = false } }
                             }
                         HStack {
-                            Text("💡 AI가 맥락을 분석하여 폴더를 자동 지정합니다.").font(.caption).foregroundColor(.secondary)
+                            Text("💡 AI가 맥락을 분석하여 폴더를 자동 지정합니다.")
+                                .font(DesignFont.bodySmall())
+                                .foregroundColor(.notionSlateAdaptive)
                             Spacer()
-                            Button("완료") {
+                            Button(action: {
                                 if !newTaskTitle.isEmpty { taskManager.addTask(title: newTaskTitle, date: selectedDate); newTaskTitle = ""; withAnimation { isAddingTask = false } }
-                            }.buttonStyle(.borderedProminent)
+                            }) {
+                                Text("완료").primaryButtonStyle()
+                            }
+                            .buttonStyle(.plain)
                         }
-                    }.padding().background(Color(NSColor.windowBackgroundColor)).cornerRadius(10).padding(.horizontal).padding(.bottom, 10)
+                    }
+                    .cardBase()
+                    .padding(.horizontal, DesignSpacing.md)
+                    .padding(.bottom, DesignSpacing.sm)
                 }
 
                 List {
                     ForEach(taskManager.tasks.filter { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }) { task in
                         if let index = taskManager.tasks.firstIndex(where: { $0.id == task.id }) {
-                            HStack(spacing: 10) {
+                            HStack(spacing: DesignSpacing.sm) {
                                 Image(systemName: taskManager.tasks[index].isCompleted ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .blue : .gray).font(.title3)
+                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .notionPurple : .notionStone)
+                                    .font(.title3)
                                     .onTapGesture { taskManager.tasks[index].isCompleted.toggle() }
                                 Text(task.title)
                                     .strikethrough(taskManager.tasks[index].isCompleted)
-                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary)
-                                    .font(.headline)
+                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .notionSteel : .notionInkAdaptive)
+                                    .font(DesignFont.bodyMedium())
                                     .lineLimit(1)
                                 Spacer()
                                 Text(task.classificationConfidence.map { "\(task.targetFolder) (\(Int($0 * 100))%)" } ?? task.targetFolder)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
+                                    .font(DesignFont.bodySmall())
+                                    .foregroundColor(.notionSlateAdaptive)
                                     .lineLimit(1)
                                 Menu {
                                     ForEach(taskManager.folderRules) { rule in
                                         Button(rule.folderName) { taskManager.userPickedFolder(taskID: task.id, folder: rule.folderName) }
                                     }
                                     if taskManager.folderRules.isEmpty {
-                                        Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.secondary)
+                                        Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.notionSlateAdaptive)
                                     }
                                 } label: {
                                     Image(systemName: "folder")
                                         .font(.title3)
-                                        .foregroundColor(.secondary)
+                                        .foregroundColor(.notionSlateAdaptive)
                                 }
                                 .menuStyle(.borderlessButton)
                                 .menuIndicator(.hidden)
                                 .fixedSize()
                                 .help("분류 폴더 변경")
                             }
-                            .padding(.vertical, 6)
+                            .padding(.vertical, DesignSpacing.xs)
                             .contextMenu { Button(role: .destructive) { taskManager.deleteTask(id: task.id) } label: { Label("삭제", systemImage: "trash") } }
                         }
                     }
                 }.listStyle(.inset)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(NSColor.textBackgroundColor))
+            .frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.notionCanvasAdaptive)
         }
         Divider()
         TipBar()
@@ -668,22 +694,33 @@ struct DownloadProgressView: View {
     @ObservedObject private var installer = ModelInstaller.shared
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: DesignSpacing.md) {
             switch installer.state {
             case .downloading(let progress, let status):
-                Text("Mistral 모델 다운로드 중").font(.title2).fontWeight(.bold)
-                ProgressView(value: progress).progressViewStyle(.linear)
-                Text(status).font(.caption).foregroundColor(.secondary).lineLimit(2)
-                Text("\(Int(progress * 100))% — 창을 닫지 마세요.").font(.caption2).foregroundColor(.secondary)
+                Text("Mistral 모델 다운로드 중")
+                    .font(DesignFont.heading2())
+                    .foregroundColor(.notionInkAdaptive)
+                ProgressView(value: progress).progressViewStyle(.linear).tint(.notionPurple)
+                Text(status)
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.notionSlateAdaptive)
+                    .lineLimit(2)
+                Text("\(Int(progress * 100))% — 창을 닫지 마세요.")
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.notionSteel)
             case .compiling:
-                Text("모델 컴파일 중").font(.title2).fontWeight(.bold)
-                ProgressView().progressViewStyle(.linear)
-                Text("CoreML이 .mlpackage를 .mlmodelc로 컴파일하고 있습니다 (수십 초~수 분 소요).").font(.caption).foregroundColor(.secondary)
+                Text("모델 컴파일 중")
+                    .font(DesignFont.heading2())
+                    .foregroundColor(.notionInkAdaptive)
+                ProgressView().progressViewStyle(.linear).tint(.notionPurple)
+                Text("CoreML이 .mlpackage를 .mlmodelc로 컴파일하고 있습니다 (수십 초~수 분 소요).")
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.notionSlateAdaptive)
             default:
-                ProgressView().progressViewStyle(.linear)
+                ProgressView().progressViewStyle(.linear).tint(.notionPurple)
             }
         }
-        .padding(24)
+        .padding(DesignSpacing.lg)
         .frame(width: 480)
     }
 }
@@ -705,58 +742,96 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-        VStack(alignment: .leading, spacing: 15) {
-            Text("⚙️ 감시 규칙 및 실제 폴더 연결").font(.title2).fontWeight(.bold)
+        VStack(alignment: .leading, spacing: DesignSpacing.md) {
+            Text("⚙️ 감시 규칙 및 실제 폴더 연결")
+                .font(DesignFont.heading2())
+                .foregroundColor(.notionInkAdaptive)
 
             List {
                 ForEach(taskManager.folderRules) { rule in
                     HStack {
-                        VStack(alignment: .leading) {
-                            Text("📁 \(rule.folderName)").font(.headline)
+                        VStack(alignment: .leading, spacing: DesignSpacing.xxs) {
+                            Text("📁 \(rule.folderName)")
+                                .font(DesignFont.bodyMedium())
+                                .foregroundColor(.notionInkAdaptive)
                             if let resolved = try? rule.resolveURL() {
-                                Text(resolved.url.lastPathComponent).font(.caption).foregroundColor(.secondary)
+                                Text(resolved.url.lastPathComponent)
+                                    .font(DesignFont.bodySmall())
+                                    .foregroundColor(.notionSlateAdaptive)
                             } else {
-                                Text("(경로 해석 실패 — 폴더를 다시 선택하세요)").font(.caption).foregroundColor(.red)
+                                Text("(경로 해석 실패 — 폴더를 다시 선택하세요)")
+                                    .font(DesignFont.bodySmall())
+                                    .foregroundColor(.red)
                             }
                         }
                         Spacer()
-                        Button("삭제") { taskManager.deleteRule(id: rule.id) }.buttonStyle(.plain).foregroundColor(.red)
-                    }.padding(.vertical, 4)
+                        Button("삭제") { taskManager.deleteRule(id: rule.id) }
+                            .buttonStyle(.plain)
+                            .font(DesignFont.button())
+                            .foregroundColor(.red)
+                    }
+                    .padding(.vertical, DesignSpacing.xxs)
                 }
-            }.listStyle(.bordered).frame(height: 150)
+            }
+            .listStyle(.bordered)
+            .frame(height: 150)
 
             Divider()
-            Text("새 감시 폴더 추가").font(.headline)
-            VStack(spacing: 10) {
-                HStack { Text("분류할 별명:"); TextField("예: 운영체제", text: $newFolderName).textFieldStyle(.roundedBorder) }
+            Text("새 감시 폴더 추가")
+                .font(DesignFont.heading3())
+                .foregroundColor(.notionInkAdaptive)
+            VStack(spacing: DesignSpacing.sm) {
                 HStack {
-                    Text("실제 폴더:"); Text(selectedURL?.lastPathComponent ?? "선택 안 됨").foregroundColor(selectedURL == nil ? .red : .blue)
+                    Text("분류할 별명:").font(DesignFont.bodySmall()).foregroundColor(.notionSlateAdaptive)
+                    TextField("예: 운영체제", text: $newFolderName).textFieldStyle(.roundedBorder)
+                }
+                HStack {
+                    Text("실제 폴더:").font(DesignFont.bodySmall()).foregroundColor(.notionSlateAdaptive)
+                    Text(selectedURL?.lastPathComponent ?? "선택 안 됨")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(selectedURL == nil ? .red : .notionPurple)
                     Spacer()
-                    Button("폴더 찾기") { selectFolderFromMac() }
+                    Button(action: { selectFolderFromMac() }) {
+                        Text("폴더 찾기").secondaryButtonStyle()
+                    }
+                    .buttonStyle(.plain)
                 }
                 if let addRuleError {
-                    Text("⚠️ \(addRuleError)").font(.caption).foregroundColor(.orange)
+                    Text("⚠️ \(addRuleError)")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.orange)
                 }
-                Button("추가하고 감시 시작하기") {
-                    if !newFolderName.isEmpty, let url = selectedURL {
-                        do {
-                            let bookmark = try url.bookmarkData(
-                                options: .withSecurityScope,
-                                includingResourceValuesForKeys: nil,
-                                relativeTo: nil
-                            )
-                            taskManager.addRule(name: newFolderName, bookmark: bookmark)
-                            newFolderName = ""; selectedURL = nil; addRuleError = nil
-                        } catch {
-                            addRuleError = "북마크 생성 실패: \(error.localizedDescription)"
+                HStack {
+                    Spacer()
+                    Button(action: {
+                        if !newFolderName.isEmpty, let url = selectedURL {
+                            do {
+                                let bookmark = try url.bookmarkData(
+                                    options: .withSecurityScope,
+                                    includingResourceValuesForKeys: nil,
+                                    relativeTo: nil
+                                )
+                                taskManager.addRule(name: newFolderName, bookmark: bookmark)
+                                newFolderName = ""; selectedURL = nil; addRuleError = nil
+                            } catch {
+                                addRuleError = "북마크 생성 실패: \(error.localizedDescription)"
+                            }
                         }
+                    }) {
+                        Text("추가하고 감시 시작하기").primaryButtonStyle()
                     }
-                }.buttonStyle(.borderedProminent).disabled(newFolderName.isEmpty || selectedURL == nil)
-            }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
+                    .buttonStyle(.plain)
+                    .disabled(newFolderName.isEmpty || selectedURL == nil)
+                    .opacity((newFolderName.isEmpty || selectedURL == nil) ? 0.5 : 1.0)
+                }
+            }
+            .cardBase()
 
             Divider()
-            Text("속도 벤치마크").font(.headline)
-            VStack(alignment: .leading, spacing: 8) {
+            Text("속도 벤치마크")
+                .font(DesignFont.heading3())
+                .foregroundColor(.notionInkAdaptive)
+            VStack(alignment: .leading, spacing: DesignSpacing.xs) {
                 Picker("Compute Units:", selection: $computeUnits) {
                     Text("CPU + GPU (권장)").tag(MLComputeUnits.cpuAndGPU)
                     Text("ANE + GPU + CPU (.all)").tag(MLComputeUnits.all)
@@ -767,46 +842,63 @@ struct SettingsView: View {
                     Task { await LocalLLMService.shared.setComputeUnits(new) }
                 }
                 Text("바꾸면 모델 재로드 필요 — 첫 분류 전 잠시 대기")
-                    .font(.caption2).foregroundColor(.secondary)
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.notionSteel)
                 Text("CPU only / ANE-only 모드는 Stateful Mistral과 호환 안 됨 (2026-05-04 확인)")
-                    .font(.caption2).foregroundColor(.secondary)
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.notionSteel)
 
                 if taskManager.folderRules.count < 2 {
                     Text("폴더 규칙이 2개 이상 있어야 분류기가 동작해요. 위에서 폴더를 추가해 주세요.")
-                        .font(.caption).foregroundColor(.orange)
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     HStack {
-                        Button(benchmarkRunning ? "중단" : "벤치마크 실행 (\(Self.benchmarkIterations)회 랜덤)") {
-                            if benchmarkRunning {
-                                benchmarkTask?.cancel()
-                            } else {
-                                runBenchmark()
-                            }
-                        }.buttonStyle(.borderedProminent)
+                        Button(action: {
+                            if benchmarkRunning { benchmarkTask?.cancel() }
+                            else { runBenchmark() }
+                        }) {
+                            Text(benchmarkRunning ? "중단" : "벤치마크 실행 (\(Self.benchmarkIterations)회 랜덤)")
+                                .primaryButtonStyle()
+                        }
+                        .buttonStyle(.plain)
                         Text("프리셋 \(Self.benchmarkPresets.count)개에서 \(Self.benchmarkIterations)개 랜덤 추출")
-                            .font(.caption2).foregroundColor(.secondary)
+                            .font(DesignFont.bodySmall())
+                            .foregroundColor(.notionSteel)
                         Spacer()
                     }
                     if benchmarkRunning {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
+                        HStack(spacing: DesignSpacing.xs) {
+                            ProgressView().controlSize(.small).tint(.notionPurple)
                             Text("진행 \(benchmarkProgress)/\(Self.benchmarkIterations)…")
-                                .font(.caption).foregroundColor(.secondary)
+                                .font(DesignFont.bodySmall())
+                                .foregroundColor(.notionSlateAdaptive)
                         }
                     }
                     if let result = benchmarkResult {
                         Text(result)
-                            .font(.caption).foregroundColor(.secondary)
+                            .font(DesignFont.bodySmall())
+                            .foregroundColor(.notionSlateAdaptive)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-            }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
+            }
+            .cardBase()
 
-            HStack { Spacer(); Button("닫기") { dismiss() }.keyboardShortcut(.escape) }
-        }.padding()
+            HStack {
+                Spacer()
+                Button(action: { dismiss() }) {
+                    Text("닫기").secondaryButtonStyle()
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape)
+            }
+        }
+        .padding(DesignSpacing.lg)
         }
         .frame(width: 500, height: 600)
+        .background(Color.notionSurfaceAdaptive)
     }
 
     private func selectFolderFromMac() {
