@@ -204,12 +204,16 @@ class TaskManager: ObservableObject {
     }
 
     func deleteRule(id: UUID) {
+        // Order matters — remove from monitors dict FIRST so any in-flight
+        // handleNewFileDetected Task that's about to access monitors[id]?.scopedURL
+        // gets nil and bails. Otherwise it can race with stopAccessingSecurityScopedResource()
+        // and trigger a dispatch_assert_queue_fail crash in Foundation.
+        let entry = monitors.removeValue(forKey: id)
         folderRules.removeAll { $0.id == id }
-        if let entry = monitors[id] {
+        if let entry {
             entry.monitor.stopMonitoring()
             entry.scopedURL.stopAccessingSecurityScopedResource()
         }
-        monitors.removeValue(forKey: id)
     }
 
     // 폴더 감시 시작
@@ -525,8 +529,41 @@ struct ContentView: View {
     @StateObject private var modelInstaller = ModelInstaller.shared
     @State private var selectedDate = Date()
     @State private var isAddingTask = false
+    /// 외부 패널(isAddingTask)과 분리해 inner content 애니메이션 타이밍을 제어.
+    /// close 시: showAddContent 먼저(120ms easeOut) → 80ms 뒤 isAddingTask false(350ms easeInOut).
+    /// open 시: isAddingTask 먼저 → 150ms 뒤 showAddContent.
+    @State private var showAddContent = false
     @State private var showSettings = false
     @State private var newTaskTitle = ""
+
+    private func presentAddTask() {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            isAddingTask = true
+        }
+        withAnimation(.easeIn(duration: 0.2).delay(0.15)) {
+            showAddContent = true
+        }
+    }
+
+    private func dismissAddTask() {
+        withAnimation(.easeOut(duration: 0.12)) {
+            showAddContent = false
+        }
+        withAnimation(.easeInOut(duration: 0.35).delay(0.08)) {
+            isAddingTask = false
+        }
+    }
+
+    private func toggleAddTask() {
+        if isAddingTask { dismissAddTask() } else { presentAddTask() }
+    }
+
+    private func submitAddTask() {
+        guard !newTaskTitle.isEmpty else { return }
+        taskManager.addTask(title: newTaskTitle, date: selectedDate)
+        newTaskTitle = ""
+        dismissAddTask()
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -543,7 +580,7 @@ struct ContentView: View {
                     Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록").font(.title).fontWeight(.heavy)
                     Spacer()
                     Button(action: { showSettings.toggle() }) { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.secondary) }.buttonStyle(.plain).padding(.trailing, 10)
-                    Button(action: { withAnimation { isAddingTask.toggle() } }) { Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill").font(.title).foregroundColor(isAddingTask ? .gray : .blue) }.buttonStyle(.plain)
+                    Button(action: { toggleAddTask() }) { Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill").font(.title).foregroundColor(isAddingTask ? .gray : .blue) }.buttonStyle(.plain)
                 }.padding(.horizontal).padding(.top, 25).padding(.bottom, 15)
 
                 if let calendarError = taskManager.lastCalendarError {
@@ -556,17 +593,15 @@ struct ContentView: View {
 
                 if isAddingTask {
                     VStack(spacing: 12) {
-                        TextField("할 일 제목 (예: 운영체제 과제)", text: $newTaskTitle)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit {
-                                if !newTaskTitle.isEmpty { taskManager.addTask(title: newTaskTitle, date: selectedDate); newTaskTitle = ""; withAnimation { isAddingTask = false } }
+                        if showAddContent {
+                            TextField("할 일 제목 (예: 운영체제 과제)", text: $newTaskTitle)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit { submitAddTask() }
+                            HStack {
+                                Text("💡 AI가 맥락을 분석하여 폴더를 자동 지정합니다.").font(.caption).foregroundColor(.secondary)
+                                Spacer()
+                                Button("완료") { submitAddTask() }.buttonStyle(.borderedProminent)
                             }
-                        HStack {
-                            Text("💡 AI가 맥락을 분석하여 폴더를 자동 지정합니다.").font(.caption).foregroundColor(.secondary)
-                            Spacer()
-                            Button("완료") {
-                                if !newTaskTitle.isEmpty { taskManager.addTask(title: newTaskTitle, date: selectedDate); newTaskTitle = ""; withAnimation { isAddingTask = false } }
-                            }.buttonStyle(.borderedProminent)
                         }
                     }.padding().background(Color(NSColor.windowBackgroundColor)).cornerRadius(10).padding(.horizontal).padding(.bottom, 10)
                 }
