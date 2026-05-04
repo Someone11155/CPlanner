@@ -35,6 +35,11 @@ actor LocalLLMService {
     /// 모두 시도해 모은 set. setupMistral() 끝에서 한 번만 빌드하고 classifyTask()에서 재사용.
     /// 비어 있으면(빌드 실패 등) 기존 top-K fallback 경로 사용.
     private var alphabetTokenIDs: [String: [Int]] = [:]
+    /// D — 현재 적용된 MLComputeUnits. UserDefaults persistence는 안전상 제거됨 (세션 한정).
+    /// 기본값 `.cpuAndGPU` — 2026-05-04 벤치마크에서 `.all`(10.88s)보다 19% 빠름(8.83s).
+    /// `.cpuOnly` / `.cpuAndNeuralEngine`은 Stateful Mistral mlpackage가 hang 유발 → Picker에서 제외됨.
+    private static let computeUnitsKey = "cplanner.computeUnits"
+    private(set) var currentComputeUnits: MLComputeUnits = .cpuAndGPU
 
     private init() {}
 
@@ -69,7 +74,11 @@ actor LocalLLMService {
     }
 
     private func setupMistral() async {
-        llmLogger.info("[Mistral 7B] 모델 로딩 시작")
+        llmLogger.info("[Mistral 7B] 모델 로딩 시작 (computeUnits = \(self.currentComputeUnits.label, privacy: .public))")
+        // D — 안전성: 이전 세션에 stuck 유발한 UserDefaults 잔재 청소.
+        // Picker 변경은 세션 한정 (currentComputeUnits 멤버에만 보관). 앱 재시작 시 항상 .all로 깨끗하게 시작.
+        UserDefaults.standard.removeObject(forKey: Self.computeUnitsKey)
+
         let location = await MainActor.run { ModelInstaller.shared.resolveModelLocation() }
         guard let location else {
             llmLogger.warning("모델/토크나이저가 설치되지 않음 — classifyTask는 '일반'을 반환")
@@ -79,15 +88,31 @@ actor LocalLLMService {
             self.tokenizer = try await AutoTokenizer.from(modelFolder: location)
 
             let configML = MLModelConfiguration()
-            configML.computeUnits = .all
+            configML.computeUnits = self.currentComputeUnits
 
             let modelURL = location.appendingPathComponent("StatefulMistral7BInstructInt4.mlmodelc")
             self.monoModel = try MLModel(contentsOf: modelURL, configuration: configML)
             buildAlphabetTokenMap()
-            llmLogger.info("[Mistral 7B] 로딩 완료")
+            llmLogger.info("[Mistral 7B] 로딩 완료 (computeUnits = \(self.currentComputeUnits.label, privacy: .public))")
         } catch {
             llmLogger.error("초기화 실패: \(error.localizedDescription, privacy: .public)")
+            // 비기본 compute units에서 throw된 실패 시 .all로 복원.
+            // 단 hang(throw 안 함) 케이스는 여기 안 옴 — 그 경우는 사용자가 force-quit 후 자동으로 .all 복귀.
+            if self.currentComputeUnits != .all {
+                self.currentComputeUnits = .all
+                llmLogger.warning("[Mistral 7B] 비기본 compute units에서 throw — .all로 즉시 복원, 자동 reload")
+                ensureLoadTaskStarted()
+            }
         }
+    }
+
+    /// D — Compute units 변경 + 모델 reload. 새 값이 현재와 같으면 no-op.
+    /// 세션 한정 (UserDefaults에 저장 안 함) — 앱 재시작 시 항상 .all로 시작.
+    func setComputeUnits(_ units: MLComputeUnits) {
+        guard units != currentComputeUnits else { return }
+        currentComputeUnits = units
+        llmLogger.info("[Mistral 7B] compute units 변경 요청 → \(units.label, privacy: .public) — reload 시작")
+        reload()
     }
 
     /// A~Z 각 letter에 대해 SentencePiece 변형으로 인코딩해 token ID를 모음.
@@ -272,5 +297,18 @@ actor LocalLLMService {
         let lower = fileName.lowercased()
         let junk = [".dmg", ".exe", ".mp4", ".zip"]
         return !junk.contains(where: { lower.hasSuffix($0) }) && lower.count >= 2
+    }
+}
+
+/// D — UI 표시용 라벨. CoreML enum의 raw int를 한국어로.
+extension MLComputeUnits {
+    nonisolated var label: String {
+        switch self {
+        case .cpuOnly: return "CPU만"
+        case .cpuAndGPU: return "CPU + GPU"
+        case .all: return "ANE + GPU + CPU"
+        case .cpuAndNeuralEngine: return "CPU + Neural Engine"
+        @unknown default: return "알 수 없음 (\(rawValue))"
+        }
     }
 }

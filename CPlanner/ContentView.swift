@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Combine
+import CoreML
 import EventKit
 import os
 
@@ -685,6 +686,9 @@ struct SettingsView: View {
     @State private var benchmarkProgress = 0
     @State private var benchmarkResult: String? = nil
     @State private var benchmarkTask: Task<Void, Never>? = nil
+    // 세션 한정 — UserDefaults persistence 제거됨. 앱 재시작 시 .cpuAndGPU로 시작.
+    // 2026-05-04 벤치마크에서 .cpuAndGPU가 .all보다 19% 빠름 (8.83s vs 10.88s/분류).
+    @State private var computeUnits: MLComputeUnits = .cpuAndGPU
 
     var body: some View {
         ScrollView {
@@ -740,6 +744,20 @@ struct SettingsView: View {
             Divider()
             Text("속도 벤치마크").font(.headline)
             VStack(alignment: .leading, spacing: 8) {
+                Picker("Compute Units:", selection: $computeUnits) {
+                    Text("CPU + GPU (권장)").tag(MLComputeUnits.cpuAndGPU)
+                    Text("ANE + GPU + CPU (.all)").tag(MLComputeUnits.all)
+                }
+                .pickerStyle(.menu)
+                .disabled(benchmarkRunning)
+                .onChange(of: computeUnits) { _, new in
+                    Task { await LocalLLMService.shared.setComputeUnits(new) }
+                }
+                Text("바꾸면 모델 재로드 필요 — 첫 분류 전 잠시 대기")
+                    .font(.caption2).foregroundColor(.secondary)
+                Text("CPU only / ANE-only 모드는 Stateful Mistral과 호환 안 됨 (2026-05-04 확인)")
+                    .font(.caption2).foregroundColor(.secondary)
+
                 if taskManager.folderRules.count < 2 {
                     Text("폴더 규칙이 2개 이상 있어야 분류기가 동작해요. 위에서 폴더를 추가해 주세요.")
                         .font(.caption).foregroundColor(.orange)
@@ -841,11 +859,12 @@ struct SettingsView: View {
             let cancelled = Task.isCancelled
             let avg = total > 0 ? totalTime / Double(total) : 0
             let wall = Date().timeIntervalSince(startWall)
+            let units = await LocalLLMService.shared.currentComputeUnits.label
             benchmarkResult = cancelled
-                ? String(format: "중단됨 (진행 %d/%d) · 평균 %.2fs · 누적 %.1fs",
-                         total, Self.benchmarkIterations, avg, wall)
-                : String(format: "%d회 평균 추론 시간 %.2fs · 총 %.1fs",
-                         total, avg, wall)
+                ? String(format: "[%@] 중단됨 (진행 %d/%d) · 평균 %.2fs · 누적 %.1fs",
+                         units, total, Self.benchmarkIterations, avg, wall)
+                : String(format: "[%@] %d회 평균 추론 시간 %.2fs · 총 %.1fs",
+                         units, total, avg, wall)
             benchmarkRunning = false
         }
     }
