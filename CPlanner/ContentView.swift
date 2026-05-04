@@ -396,9 +396,10 @@ struct CustomCalendarView: View {
     @Binding var selectedDate: Date
 
     private let calendar = Calendar.current
-    private let calendarHeaderColor = Color(NSColor.windowBackgroundColor)
-    private let selectionColor = Color.blue
     let weekdayNames = ["일", "월", "화", "수", "목", "금", "토"]
+
+    /// 다음 달=trailing(오른쪽에서 들어옴), 이전 달=leading. 월 변경 시 grid가 swipe + fade로 교체.
+    @State private var lastMonthDirection: Edge = .trailing
 
     func generateDaysInMonth() -> [Date] {
         guard let monthRange = calendar.range(of: .day, in: .month, for: selectedDate),
@@ -418,64 +419,182 @@ struct CustomCalendarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // 월/년 헤더 + prev/next chevrons
             HStack {
-                Text(selectedDate, formatter: DateFormatter.monthYearFormatter).font(.title3).fontWeight(.bold)
+                Text(selectedDate, formatter: DateFormatter.monthYearFormatter)
+                    .font(DesignFont.calendarMonth())
+                    .foregroundColor(.tdmInkPrimary)
                 Spacer()
-                HStack(spacing: 5) {
-                    Button(action: { changeMonth(value: -1) }) { Image(systemName: "chevron.left") }
-                    Button(action: { changeMonth(value: 1) }) { Image(systemName: "chevron.right") }
-                }.buttonStyle(.plain).font(.title3)
-            }.padding().background(calendarHeaderColor)
+                HStack(spacing: DesignSpacing.sm) {
+                    Button(action: { changeMonth(value: -1) }) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(.tdmInkSecondary)
+                    }
+                    Button(action: { changeMonth(value: 1) }) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(.tdmInkSecondary)
+                    }
+                }.buttonStyle(.plain)
+            }
+            .padding(.horizontal, DesignSpacing.md)
+            .padding(.vertical, DesignSpacing.md)
 
-            Divider()
+            // 요일 행 — 일=빨강 / 토=파랑 / 평일=흰
             Grid(horizontalSpacing: 0, verticalSpacing: 0) {
                 GridRow {
                     ForEach(weekdayNames, id: \.self) { weekday in
-                        Text(weekday).font(.caption).fontWeight(.medium)
-                            .foregroundColor(weekday == "일" ? .red : (weekday == "토" ? .blue : .gray))
-                            .frame(maxWidth: .infinity).frame(height: 30)
+                        Text(weekday)
+                            .font(DesignFont.caption(13))
+                            .foregroundColor(
+                                weekday == "일" ? .tdmDateSunday :
+                                weekday == "토" ? .tdmDateSaturday : .tdmInkPrimary
+                            )
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 28)
                     }
-                }.background(calendarHeaderColor)
-            }
-            Divider()
-
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 0) {
-                ForEach(generateDaysInMonth(), id: \.self) { date in
-                    let weekday = calendar.component(.weekday, from: date)
-                    let isWeekend = weekday == 1 || weekday == 7
-                    let isSelectedDay = calendar.isDate(date, inSameDayAs: selectedDate)
-                    let inSameMonth = calendar.isDate(date, equalTo: selectedDate, toGranularity: .month)
-                    VStack {
-                        ZStack {
-                            if isSelectedDay {
-                                Circle().fill(selectionColor).frame(width: 30, height: 30)
-                            }
-                            Text("\(calendar.component(.day, from: date))")
-                                .font(.system(size: 14))
-                                .fontWeight(isSelectedDay ? .bold : .medium)
-                                .foregroundColor(inSameMonth ? (isSelectedDay ? .white : .primary) : .secondary.opacity(0.5))
-                        }
-                        if hasTasks(date: date) {
-                            Circle().fill(inSameMonth ? (isSelectedDay ? .white : .blue) : .secondary.opacity(0.5)).frame(width: 4, height: 4)
-                        }
-                    }
-                    .frame(height: 50).frame(maxWidth: .infinity)
-                    .background(isWeekend ? Color.gray.opacity(0.06) : Color.clear)
-                    .overlay(Rectangle().stroke(Color.gray.opacity(0.1), lineWidth: 0.5))
-                    .contentShape(Rectangle())
-                    .onTapGesture { self.selectedDate = date }
                 }
-            }.background(Color(NSColor.controlBackgroundColor))
+            }
 
-            Divider()
+            // 날짜 그리드 — Todomate squircle 셀. 월 변경 시 좌우 슬라이드 + 페이드 transition.
+            // .id(monthKey)로 월 바뀔 때 view 재생성을 트리거 → SwiftUI가 transition 적용.
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 6) {
+                ForEach(generateDaysInMonth(), id: \.self) { date in
+                    dayCell(for: date)
+                }
+            }
+            .padding(.horizontal, DesignSpacing.xs)
+            .padding(.top, DesignSpacing.xs)
+            .id(monthIdentityKey)
+            .transition(monthSlideTransition)
+
             Spacer()
-        }.background(Color(NSColor.controlBackgroundColor))
+        }
+        .background(Color.tdmCanvas)
+    }
+
+    /// 단일 날짜 셀. 4가지 상태 조합:
+    /// - 선택: 흰 원 (active inversion) — 가장 강한 emphasis
+    /// - 오늘 (선택 아님): 흰 ring (테두리만)
+    /// - 이벤트 있음: 노란 squircle 채움
+    /// - 기본: 어두운 squircle 채움
+    /// 숫자는 셀 안에 — 단, 선택/오늘일 때는 검정/흰 (배경에 따라), 기본일 때는 weekday 색.
+    @ViewBuilder
+    private func dayCell(for date: Date) -> some View {
+        let weekday = calendar.component(.weekday, from: date)
+        let day = calendar.component(.day, from: date)
+        let isSelected = calendar.isDate(date, inSameDayAs: selectedDate)
+        let isToday = calendar.isDateInToday(date)
+        let inSameMonth = calendar.isDate(date, equalTo: selectedDate, toGranularity: .month)
+        let dots = dotCounts(for: date)
+        let totalDots = dots.total
+        let completedDots = dots.completed
+
+        let weekdayColor: Color =
+            !inSameMonth ? Color.tdmInkTertiary :
+            weekday == 1 ? .tdmDateSunday :
+            weekday == 7 ? .tdmDateSaturday : .tdmInkPrimary
+
+        VStack(spacing: 3) {
+            ZStack {
+                // 셀 squircle — 선택일은 흰, 그 외는 어두운 (이벤트 분기 제거됨; 이벤트는 점 row로만 표시)
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.tdmCapsuleActive)
+                } else {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(inSameMonth ? Color.tdmCapsule : Color.tdmCapsule.opacity(0.4))
+                }
+
+                // 오늘 표시 — 선택 아닐 때만 흰 ring
+                if isToday && !isSelected {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.tdmInkPrimary, lineWidth: 1.5)
+                }
+
+                // 숫자
+                Text("\(day)")
+                    .font(DesignFont.calendarDate(13))
+                    .foregroundColor(isSelected ? .tdmInkOnLight : weekdayColor)
+            }
+            .frame(width: 32, height: 32)
+
+            // 이벤트 인디케이터 — 왼쪽부터 체크(완료) → 점(미완료). cap 3.
+            HStack(spacing: 3) {
+                ForEach(0..<totalDots, id: \.self) { idx in
+                    if idx < completedDots {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 6, weight: .black))
+                            .foregroundColor(inSameMonth ? Color.tdmInkPrimary : Color.tdmInkTertiary)
+                            .frame(width: 6, height: 6)
+                    } else {
+                        Circle()
+                            .fill(inSameMonth ? Color.tdmInkPrimary : Color.tdmInkTertiary)
+                            .frame(width: 4, height: 4)
+                    }
+                }
+            }
+            .frame(height: 6)
+        }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                self.selectedDate = date
+            }
+        }
     }
 
     func changeMonth(value: Int) {
-        if let newDate = calendar.date(byAdding: .month, value: value, to: selectedDate) { selectedDate = newDate }
+        lastMonthDirection = value > 0 ? .trailing : .leading
+        if let newDate = calendar.date(byAdding: .month, value: value, to: selectedDate) {
+            withAnimation(.easeInOut(duration: 0.32)) {
+                selectedDate = newDate
+            }
+        }
+    }
+
+    /// 현재 표시 중인 월의 고유 key. 월/년 바뀌면 이 값도 바뀌어 .id로 view 재생성 트리거.
+    private var monthIdentityKey: String {
+        let comps = calendar.dateComponents([.year, .month], from: selectedDate)
+        return "\(comps.year ?? 0)-\(comps.month ?? 0)"
+    }
+
+    /// 좌우 슬라이드 + 페이드 — `lastMonthDirection`에 따라 들어오는 방향, 빠지는 방향 반대로.
+    private var monthSlideTransition: AnyTransition {
+        let inEdge = lastMonthDirection
+        let outEdge: Edge = (lastMonthDirection == .trailing) ? .leading : .trailing
+        return .asymmetric(
+            insertion: .move(edge: inEdge).combined(with: .opacity),
+            removal:   .move(edge: outEdge).combined(with: .opacity)
+        )
     }
     func hasTasks(date: Date) -> Bool { taskManager.tasks.contains { calendar.isDate($0.date, inSameDayAs: date) } }
+    func taskCount(for date: Date) -> Int { taskManager.tasks.lazy.filter { calendar.isDate($0.date, inSameDayAs: date) }.count }
+    func completedCount(for date: Date) -> Int {
+        taskManager.tasks.lazy.filter { calendar.isDate($0.date, inSameDayAs: date) && $0.isCompleted }.count
+    }
+
+    /// 셀 아래 점/체크 개수 결정.
+    /// - 할 일 ≤ 2개: 1:1 매핑 (할 일 1개 + 완료 1개 = 체크 1, 할 일 2개 + 완료 1개 = 체크 1 / 점 1)
+    /// - 할 일 ≥ 3개: 비율 기반 — `ceil(completed/total × 3)`. completed 1+면 자동으로 첫 체크 표시 (ceil 효과),
+    ///   비율이 1/3 / 2/3 / 1.0 임계값을 넘을 때마다 2번째 / 3번째 체크로 전환.
+    /// 정수 ceiling: `ceil(a×c/b) = (a×c + b − 1) / b`.
+    func dotCounts(for date: Date) -> (total: Int, completed: Int) {
+        let total = taskCount(for: date)
+        let completed = completedCount(for: date)
+        let totalDots = min(total, 3)
+        let completedDots: Int
+        if total == 0 {
+            completedDots = 0
+        } else if total >= 3 {
+            completedDots = min((completed * 3 + total - 1) / total, totalDots)
+        } else {
+            completedDots = min(completed, totalDots)
+        }
+        return (totalDots, completedDots)
+    }
 }
 
 // --- 3-1. 하단 팁 바 ---
@@ -493,33 +612,60 @@ struct TipBar: View {
         "신뢰도 75% 미만이면 자동으로 '일반' 폴더로 분류돼요"
     ]
 
+    @AppStorage("cplanner.app.tip.intervalSeconds") private var tipIntervalSeconds: Double = 7
     @State private var currentTip: String = TipBar.tips.randomElement() ?? ""
-    private let timer = Timer.publish(every: 7, on: .main, in: .common).autoconnect()
+    @State private var tipOpacity: Double = 1.0
+
+    /// fade out (350ms easeIn) → 텍스트 swap → fade in (450ms easeOut). 시퀀셜 cross-fade라
+    /// 단순 `.transition(.opacity)`보다 좀 더 부드럽게 인지됨.
+    private let fadeOutDuration: Double = 0.35
+    private let fadeInDuration: Double = 0.45
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: DesignSpacing.xs) {
             Text("💡")
             Text(currentTip)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .id(currentTip)
-                .transition(.opacity)
+                .font(DesignFont.bodySmall())
+                .foregroundColor(.tdmInkBio)
             Spacer()
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .opacity(tipOpacity)
+        .padding(.horizontal, DesignSpacing.md)
+        .padding(.vertical, DesignSpacing.xs)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(NSColor.windowBackgroundColor))
-        .onReceive(timer) { _ in
-            guard TipBar.tips.count > 1 else { return }
-            var next = TipBar.tips.randomElement() ?? currentTip
-            while next == currentTip {
-                next = TipBar.tips.randomElement() ?? currentTip
-            }
-            withAnimation(.easeInOut(duration: 0.3)) {
-                currentTip = next
+        .background(Color.tdmCapsule)
+        // AppSettings에서 주기 변경 시 즉시 반영되도록 .id로 timer 재구독 강제.
+        .modifier(TipTimerModifier(intervalSeconds: tipIntervalSeconds, onTick: rotateTip))
+    }
+
+    private func rotateTip() {
+        guard TipBar.tips.count > 1 else { return }
+        var next = TipBar.tips.randomElement() ?? currentTip
+        while next == currentTip {
+            next = TipBar.tips.randomElement() ?? currentTip
+        }
+        withAnimation(.easeIn(duration: fadeOutDuration)) {
+            tipOpacity = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + fadeOutDuration) {
+            currentTip = next
+            withAnimation(.easeOut(duration: fadeInDuration)) {
+                tipOpacity = 1
             }
         }
+    }
+}
+
+/// 주기를 동적으로 변경 가능한 timer modifier — AppStorage 변경 시 .id로 재구독.
+private struct TipTimerModifier: ViewModifier {
+    let intervalSeconds: Double
+    let onTick: () -> Void
+
+    func body(content: Content) -> some View {
+        content.onReceive(
+            Timer.publish(every: intervalSeconds, on: .main, in: .common).autoconnect()
+        ) { _ in onTick() }
+        .id(intervalSeconds)
     }
 }
 
@@ -535,6 +681,8 @@ struct ContentView: View {
     @State private var showAddContent = false
     @State private var showSettings = false
     @State private var newTaskTitle = ""
+    /// 앱 자체 Settings (⌘,)에서 토글되는 TipBar 표시 여부. AppStorage로 영속.
+    @AppStorage("cplanner.app.tip.enabled") private var tipEnabled: Bool = true
 
     private func presentAddTask() {
         withAnimation(.easeInOut(duration: 0.3)) {
@@ -577,6 +725,67 @@ struct ContentView: View {
         }
     }
 
+    /// List 안 task row — 삭제 시 페이드아웃 transition + withAnimation으로 부드럽게 사라짐.
+    @ViewBuilder
+    private func taskRow(task: TaskItem, index: Int) -> some View {
+        HStack(spacing: DesignSpacing.sm) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.tdmCapsuleSoft)
+                    .frame(width: 24, height: 24)
+                if taskManager.tasks[index].isCompleted {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.tdmInkPrimary)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    taskManager.tasks[index].isCompleted.toggle()
+                }
+            }
+            Text(task.title)
+                .foregroundColor(taskManager.tasks[index].isCompleted ? .tdmInkSecondary : .tdmInkPrimary)
+                .font(DesignFont.bodyMedium())
+                .lineLimit(1)
+            Spacer()
+            Text(task.classificationConfidence.map { "\(task.targetFolder) (\(Int($0 * 100))%)" } ?? task.targetFolder)
+                .font(DesignFont.bodySmall())
+                .foregroundColor(.tdmInkBio)
+                .lineLimit(1)
+            Menu {
+                ForEach(taskManager.folderRules) { rule in
+                    Button(rule.folderName) { taskManager.userPickedFolder(taskID: task.id, folder: rule.folderName) }
+                }
+                if taskManager.folderRules.isEmpty {
+                    Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.tdmInkBio)
+                }
+            } label: {
+                Image(systemName: "folder")
+                    .font(.title3)
+                    .foregroundColor(.tdmInkBio)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("분류 폴더 변경")
+        }
+        .padding(.vertical, DesignSpacing.xs)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .transition(.opacity)
+        .contextMenu {
+            Button(role: .destructive) {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    taskManager.deleteTask(id: task.id)
+                }
+            } label: {
+                Label("삭제", systemImage: "trash")
+            }
+        }
+    }
+
     var body: some View {
         ZStack {
         VStack(spacing: 0) {
@@ -590,11 +799,27 @@ struct ContentView: View {
             // 우측 할 일 목록
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록").font(.title).fontWeight(.heavy)
+                    Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록")
+                        .font(DesignFont.heading1())
+                        .foregroundColor(.tdmInkPrimary)
                     Spacer()
-                    Button(action: { toggleSettings() }) { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.secondary) }.buttonStyle(.plain).padding(.trailing, 10)
-                    Button(action: { toggleAddTask() }) { Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill").font(.title).foregroundColor(isAddingTask ? .gray : .blue) }.buttonStyle(.plain)
-                }.padding(.horizontal).padding(.top, 25).padding(.bottom, 15)
+                    Button(action: { toggleSettings() }) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.title2)
+                            .foregroundColor(.tdmInkSecondary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, DesignSpacing.sm)
+                    Button(action: { toggleAddTask() }) {
+                        Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill")
+                            .font(.title)
+                            .foregroundColor(isAddingTask ? .tdmInkTertiary : .tdmInkPrimary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, DesignSpacing.md)
+                .padding(.top, DesignSpacing.lg)
+                .padding(.bottom, DesignSpacing.md)
 
                 if let calendarError = taskManager.lastCalendarError {
                     Text("⚠️ \(calendarError)")
@@ -605,64 +830,61 @@ struct ContentView: View {
                 }
 
                 if isAddingTask {
-                    VStack(spacing: 12) {
+                    VStack(spacing: DesignSpacing.sm) {
                         if showAddContent {
                             TextField("할 일 제목 (예: 운영체제 과제)", text: $newTaskTitle)
-                                .textFieldStyle(.roundedBorder)
+                                .textFieldStyle(.plain)
+                                .font(DesignFont.body())
+                                .foregroundColor(.tdmInkPrimary)
+                                .padding(.vertical, 10)
+                                .padding(.horizontal, 14)
+                                .background(
+                                    RoundedRectangle(cornerRadius: DesignRadius.sm, style: .continuous)
+                                        .fill(Color.tdmCapsuleSoft)
+                                )
                                 .onSubmit { submitAddTask() }
                             HStack {
-                                Text("💡 AI가 맥락을 분석하여 폴더를 자동 지정합니다.").font(.caption).foregroundColor(.secondary)
+                                Text("💡 AI가 맥락을 분석하여 폴더를 자동 지정합니다.")
+                                    .font(DesignFont.bodySmall())
+                                    .foregroundColor(.tdmInkBio)
                                 Spacer()
-                                Button("완료") { submitAddTask() }.buttonStyle(.borderedProminent)
+                                Button(action: { submitAddTask() }) {
+                                    Text("완료").primaryPill()
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
-                    }.padding().background(Color(NSColor.windowBackgroundColor)).cornerRadius(10).padding(.horizontal).padding(.bottom, 10)
+                    }
+                    .padding(DesignSpacing.md)
+                    .background(
+                        RoundedRectangle(cornerRadius: DesignRadius.lg, style: .continuous)
+                            .fill(Color.tdmCapsule)
+                    )
+                    .padding(.horizontal, DesignSpacing.md)
+                    .padding(.bottom, DesignSpacing.sm)
                 }
 
                 List {
                     ForEach(taskManager.tasks.filter { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }) { task in
                         if let index = taskManager.tasks.firstIndex(where: { $0.id == task.id }) {
-                            HStack(spacing: 10) {
-                                Image(systemName: taskManager.tasks[index].isCompleted ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .blue : .gray).font(.title3)
-                                    .onTapGesture { taskManager.tasks[index].isCompleted.toggle() }
-                                Text(task.title)
-                                    .strikethrough(taskManager.tasks[index].isCompleted)
-                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary)
-                                    .font(.headline)
-                                    .lineLimit(1)
-                                Spacer()
-                                Text(task.classificationConfidence.map { "\(task.targetFolder) (\(Int($0 * 100))%)" } ?? task.targetFolder)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                                Menu {
-                                    ForEach(taskManager.folderRules) { rule in
-                                        Button(rule.folderName) { taskManager.userPickedFolder(taskID: task.id, folder: rule.folderName) }
-                                    }
-                                    if taskManager.folderRules.isEmpty {
-                                        Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.secondary)
-                                    }
-                                } label: {
-                                    Image(systemName: "folder")
-                                        .font(.title3)
-                                        .foregroundColor(.secondary)
-                                }
-                                .menuStyle(.borderlessButton)
-                                .menuIndicator(.hidden)
-                                .fixedSize()
-                                .help("분류 폴더 변경")
-                            }
-                            .padding(.vertical, 6)
-                            .contextMenu { Button(role: .destructive) { taskManager.deleteTask(id: task.id) } label: { Label("삭제", systemImage: "trash") } }
+                            taskRow(task: task, index: index)
                         }
                     }
-                }.listStyle(.inset)
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .background(Color.tdmCanvas)
+                // 다른 날짜 선택 시 List 전체가 페이드되며 새 데이터로 교체.
+                .id(selectedDate)
+                .transition(.opacity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(NSColor.textBackgroundColor))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.tdmCanvas)
         }
-        Divider()
-        TipBar()
+        if tipEnabled {
+            Divider().background(Color.tdmCapsule)
+            TipBar()
+        }
         }
 
         // 설정 in-window overlay — sheet 대신 ZStack overlay로 띄움:
@@ -670,7 +892,7 @@ struct ContentView: View {
         // (2) 외부(scrim) 클릭 시 자동 dismiss
         // (3) 패널이 메인 콘텐츠 위에 dim+scale-in 트랜지션으로 등장
         if showSettings {
-            Color.black.opacity(0.25)
+            Color.black.opacity(0.55)
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture { dismissSettings() }
@@ -683,6 +905,7 @@ struct ContentView: View {
                 .zIndex(2)
         }
         }
+        .background(Color.tdmCanvas.ignoresSafeArea())
         .alert("Mistral 모델 다운로드 필요", isPresented: needsDownloadBinding) {
             Button("다운로드 (~ 4 GB)") { modelInstaller.startDownload() }
             Button("나중에", role: .cancel) { modelInstaller.skip() }
@@ -734,23 +957,39 @@ struct DownloadProgressView: View {
     @ObservedObject private var installer = ModelInstaller.shared
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: DesignSpacing.md) {
             switch installer.state {
             case .downloading(let progress, let status):
-                Text("Mistral 모델 다운로드 중").font(.title2).fontWeight(.bold)
-                ProgressView(value: progress).progressViewStyle(.linear)
-                Text(status).font(.caption).foregroundColor(.secondary).lineLimit(2)
-                Text("\(Int(progress * 100))% — 창을 닫지 마세요.").font(.caption2).foregroundColor(.secondary)
+                Text("Mistral 모델 다운로드 중")
+                    .font(DesignFont.heading2())
+                    .foregroundColor(.tdmInkPrimary)
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .tint(.tdmYellow)
+                Text(status)
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.tdmInkBio)
+                    .lineLimit(2)
+                Text("\(Int(progress * 100))% — 창을 닫지 마세요.")
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.tdmInkTertiary)
             case .compiling:
-                Text("모델 컴파일 중").font(.title2).fontWeight(.bold)
-                ProgressView().progressViewStyle(.linear)
-                Text("CoreML이 .mlpackage를 .mlmodelc로 컴파일하고 있습니다 (수십 초~수 분 소요).").font(.caption).foregroundColor(.secondary)
+                Text("모델 컴파일 중")
+                    .font(DesignFont.heading2())
+                    .foregroundColor(.tdmInkPrimary)
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(.tdmYellow)
+                Text("CoreML이 .mlpackage를 .mlmodelc로 컴파일하고 있습니다 (수십 초~수 분 소요).")
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.tdmInkBio)
             default:
-                ProgressView().progressViewStyle(.linear)
+                ProgressView().progressViewStyle(.linear).tint(.tdmYellow)
             }
         }
-        .padding(24)
+        .padding(DesignSpacing.lg)
         .frame(width: 480)
+        .background(Color.tdmBgMenu)
     }
 }
 
@@ -773,58 +1012,139 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-        VStack(alignment: .leading, spacing: 15) {
-            Text("⚙️ 감시 규칙 및 실제 폴더 연결").font(.title2).fontWeight(.bold)
+        VStack(alignment: .leading, spacing: DesignSpacing.md) {
+            // 드래그 핸들 (Todomate 패턴 — 시각적 anchor)
+            HStack {
+                Spacer()
+                Capsule()
+                    .fill(Color.tdmInkTertiary)
+                    .frame(width: 36, height: 4)
+                Spacer()
+            }
+            .padding(.top, DesignSpacing.xs)
+            .padding(.bottom, DesignSpacing.xs)
 
-            List {
+            Text("⚙️ 감시 규칙 및 실제 폴더 연결")
+                .font(DesignFont.heading2())
+                .foregroundColor(.tdmInkPrimary)
+
+            // 폴더 규칙 리스트
+            VStack(spacing: DesignSpacing.xs) {
                 ForEach(taskManager.folderRules) { rule in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text("📁 \(rule.folderName)").font(.headline)
+                    HStack(spacing: DesignSpacing.sm) {
+                        VStack(alignment: .leading, spacing: DesignSpacing.xxs) {
+                            Text("📁 \(rule.folderName)")
+                                .font(DesignFont.bodyMedium())
+                                .foregroundColor(.tdmInkPrimary)
                             if let resolved = try? rule.resolveURL() {
-                                Text(resolved.url.lastPathComponent).font(.caption).foregroundColor(.secondary)
+                                Text(resolved.url.lastPathComponent)
+                                    .font(DesignFont.bodySmall())
+                                    .foregroundColor(.tdmInkBio)
                             } else {
-                                Text("(경로 해석 실패 — 폴더를 다시 선택하세요)").font(.caption).foregroundColor(.red)
+                                Text("(경로 해석 실패 — 폴더를 다시 선택하세요)")
+                                    .font(DesignFont.bodySmall())
+                                    .foregroundColor(.tdmDateSunday)
                             }
                         }
                         Spacer()
-                        Button("삭제") { taskManager.deleteRule(id: rule.id) }.buttonStyle(.plain).foregroundColor(.red)
-                    }.padding(.vertical, 4)
+                        Button("삭제") { taskManager.deleteRule(id: rule.id) }
+                            .buttonStyle(.plain)
+                            .font(DesignFont.button(13))
+                            .foregroundColor(.tdmDateSunday)
+                    }
+                    .padding(.vertical, DesignSpacing.xs)
+                    .padding(.horizontal, DesignSpacing.sm)
+                    .background(
+                        RoundedRectangle(cornerRadius: DesignRadius.sm, style: .continuous)
+                            .fill(Color.tdmCapsuleSoft)
+                    )
                 }
-            }.listStyle(.bordered).frame(height: 150)
+                if taskManager.folderRules.isEmpty {
+                    Text("등록된 폴더가 없어요")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmInkBio)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, DesignSpacing.md)
+                }
+            }
 
-            Divider()
-            Text("새 감시 폴더 추가").font(.headline)
-            VStack(spacing: 10) {
-                HStack { Text("분류할 별명:"); TextField("예: 운영체제", text: $newFolderName).textFieldStyle(.roundedBorder) }
+            Divider().background(Color.tdmCapsuleSoft)
+
+            // 새 감시 폴더 추가
+            Text("새 감시 폴더 추가")
+                .font(DesignFont.heading3())
+                .foregroundColor(.tdmInkPrimary)
+            VStack(spacing: DesignSpacing.sm) {
                 HStack {
-                    Text("실제 폴더:"); Text(selectedURL?.lastPathComponent ?? "선택 안 됨").foregroundColor(selectedURL == nil ? .red : .blue)
+                    Text("분류할 별명:")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmInkBio)
+                    TextField("예: 운영체제", text: $newFolderName)
+                        .textFieldStyle(.plain)
+                        .font(DesignFont.body())
+                        .foregroundColor(.tdmInkPrimary)
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 12)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignRadius.sm, style: .continuous)
+                                .fill(Color.tdmCapsule)
+                        )
+                }
+                HStack {
+                    Text("실제 폴더:")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmInkBio)
+                    Text(selectedURL?.lastPathComponent ?? "선택 안 됨")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(selectedURL == nil ? .tdmDateSunday : .tdmDateSaturday)
                     Spacer()
-                    Button("폴더 찾기") { selectFolderFromMac() }
+                    Button(action: { selectFolderFromMac() }) {
+                        Text("폴더 찾기").secondaryPill()
+                    }
+                    .buttonStyle(.plain)
                 }
                 if let addRuleError {
-                    Text("⚠️ \(addRuleError)").font(.caption).foregroundColor(.orange)
+                    Text("⚠️ \(addRuleError)")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmIconRepeatTomorrow)
                 }
-                Button("추가하고 감시 시작하기") {
-                    if !newFolderName.isEmpty, let url = selectedURL {
-                        do {
-                            let bookmark = try url.bookmarkData(
-                                options: .withSecurityScope,
-                                includingResourceValuesForKeys: nil,
-                                relativeTo: nil
-                            )
-                            taskManager.addRule(name: newFolderName, bookmark: bookmark)
-                            newFolderName = ""; selectedURL = nil; addRuleError = nil
-                        } catch {
-                            addRuleError = "북마크 생성 실패: \(error.localizedDescription)"
+                HStack {
+                    Spacer()
+                    Button(action: {
+                        if !newFolderName.isEmpty, let url = selectedURL {
+                            do {
+                                let bookmark = try url.bookmarkData(
+                                    options: .withSecurityScope,
+                                    includingResourceValuesForKeys: nil,
+                                    relativeTo: nil
+                                )
+                                taskManager.addRule(name: newFolderName, bookmark: bookmark)
+                                newFolderName = ""; selectedURL = nil; addRuleError = nil
+                            } catch {
+                                addRuleError = "북마크 생성 실패: \(error.localizedDescription)"
+                            }
                         }
+                    }) {
+                        Text("추가하고 감시 시작하기").primaryPill()
                     }
-                }.buttonStyle(.borderedProminent).disabled(newFolderName.isEmpty || selectedURL == nil)
-            }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
+                    .buttonStyle(.plain)
+                    .disabled(newFolderName.isEmpty || selectedURL == nil)
+                    .opacity((newFolderName.isEmpty || selectedURL == nil) ? 0.4 : 1.0)
+                }
+            }
+            .padding(DesignSpacing.md)
+            .background(
+                RoundedRectangle(cornerRadius: DesignRadius.md, style: .continuous)
+                    .fill(Color.tdmCapsule)
+            )
 
-            Divider()
-            Text("속도 벤치마크").font(.headline)
-            VStack(alignment: .leading, spacing: 8) {
+            Divider().background(Color.tdmCapsuleSoft)
+
+            // 속도 벤치마크
+            Text("속도 벤치마크")
+                .font(DesignFont.heading3())
+                .foregroundColor(.tdmInkPrimary)
+            VStack(alignment: .leading, spacing: DesignSpacing.xs) {
                 Picker("Compute Units:", selection: $computeUnits) {
                     Text("CPU + GPU (권장)").tag(MLComputeUnits.cpuAndGPU)
                     Text("ANE + GPU + CPU (.all)").tag(MLComputeUnits.all)
@@ -835,52 +1155,70 @@ struct SettingsView: View {
                     Task { await LocalLLMService.shared.setComputeUnits(new) }
                 }
                 Text("바꾸면 모델 재로드 필요 — 첫 분류 전 잠시 대기")
-                    .font(.caption2).foregroundColor(.secondary)
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.tdmInkTertiary)
                 Text("CPU only / ANE-only 모드는 Stateful Mistral과 호환 안 됨 (2026-05-04 확인)")
-                    .font(.caption2).foregroundColor(.secondary)
+                    .font(DesignFont.bodySmall())
+                    .foregroundColor(.tdmInkTertiary)
 
                 if taskManager.folderRules.count < 2 {
                     Text("폴더 규칙이 2개 이상 있어야 분류기가 동작해요. 위에서 폴더를 추가해 주세요.")
-                        .font(.caption).foregroundColor(.orange)
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmIconRepeatTomorrow)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     HStack {
-                        Button(benchmarkRunning ? "중단" : "벤치마크 실행 (\(Self.benchmarkIterations)회 랜덤)") {
-                            if benchmarkRunning {
-                                benchmarkTask?.cancel()
-                            } else {
-                                runBenchmark()
-                            }
-                        }.buttonStyle(.borderedProminent)
+                        Button(action: {
+                            if benchmarkRunning { benchmarkTask?.cancel() }
+                            else { runBenchmark() }
+                        }) {
+                            Text(benchmarkRunning ? "중단" : "벤치마크 실행 (\(Self.benchmarkIterations)회 랜덤)")
+                                .primaryPill()
+                        }
+                        .buttonStyle(.plain)
                         Text("프리셋 \(Self.benchmarkPresets.count)개에서 \(Self.benchmarkIterations)개 랜덤 추출")
-                            .font(.caption2).foregroundColor(.secondary)
+                            .font(DesignFont.bodySmall())
+                            .foregroundColor(.tdmInkTertiary)
                         Spacer()
                     }
                     if benchmarkRunning {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
+                        HStack(spacing: DesignSpacing.xs) {
+                            ProgressView().controlSize(.small).tint(.tdmYellow)
                             Text("진행 \(benchmarkProgress)/\(Self.benchmarkIterations)…")
-                                .font(.caption).foregroundColor(.secondary)
+                                .font(DesignFont.bodySmall())
+                                .foregroundColor(.tdmInkBio)
                         }
                     }
                     if let result = benchmarkResult {
                         Text(result)
-                            .font(.caption).foregroundColor(.secondary)
+                            .font(DesignFont.bodySmall())
+                            .foregroundColor(.tdmInkBio)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-            }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
+            }
+            .padding(DesignSpacing.md)
+            .background(
+                RoundedRectangle(cornerRadius: DesignRadius.md, style: .continuous)
+                    .fill(Color.tdmCapsule)
+            )
 
-            HStack { Spacer(); Button("닫기") { onDismiss() }.keyboardShortcut(.escape) }
-        }.padding()
+            HStack {
+                Spacer()
+                Button(action: { onDismiss() }) {
+                    Text("닫기").secondaryPill()
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape)
+            }
         }
-        // maxWidth/maxHeight로 cap — 메인 윈도우가 작으면 패널도 그만큼 축소되어 윈도우 밖으로 안 나감.
+        .padding(DesignSpacing.lg)
+        }
         .frame(maxWidth: 500, maxHeight: 600)
-        .background(Color(NSColor.windowBackgroundColor))
-        .cornerRadius(12)
-        .shadow(color: .black.opacity(0.25), radius: 30, x: 0, y: 8)
-        // 패널 위 클릭이 뒤 scrim의 onTapGesture로 빠지지 않도록 패널 전체 영역을 hit-testable로.
-        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .background(Color.tdmBgMenu)
+        .clipShape(RoundedRectangle(cornerRadius: DesignRadius.lg, style: .continuous))
+        .shadow(color: .black.opacity(0.5), radius: 40, x: 0, y: 12)
+        .contentShape(RoundedRectangle(cornerRadius: DesignRadius.lg, style: .continuous))
     }
 
     private func selectFolderFromMac() {

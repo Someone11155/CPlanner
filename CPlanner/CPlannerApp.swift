@@ -19,7 +19,17 @@ struct CplannerApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                // Todomate 디자인은 다크 전용. 시스템 라이트 모드에서도 일관된 비주얼.
+                .preferredColorScheme(.dark)
         }
         .defaultSize(width: 1000, height: 750)
+
+        // macOS 표준 Preferences/Settings 윈도우 — 메뉴바 `CPlanner > Settings...` 또는 ⌘,로 접근.
+        // ContentView 안의 톱니 아이콘이 띄우는 SettingsView (감시 폴더 + 벤치마크)와는 별개 —
+        // 여기는 "앱 자체"에 대한 일반 설정 (TipBar 옵션, 분류 임계값, 앱 정보 등).
+        Settings {
+            AppSettingsView()
+                .preferredColorScheme(.dark)
+        }
     }
 }
