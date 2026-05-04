@@ -462,6 +462,49 @@ struct CustomCalendarView: View {
     func hasTasks(date: Date) -> Bool { taskManager.tasks.contains { calendar.isDate($0.date, inSameDayAs: date) } }
 }
 
+// --- 3-1. 하단 팁 바 ---
+struct TipBar: View {
+    static let tips: [String] = [
+        "분류 결과를 수정하려면 폴더 아이콘을 클릭하세요",
+        "수동으로 분류하면 다음 자동 분류의 학습 예시로 사용돼요",
+        "캘린더에서 추가한 일정도 자동으로 동기화돼요",
+        "AI 분류는 인터넷 없이 기기 안에서 동작해요",
+        "설정에서 폴더 감시 규칙을 추가할 수 있어요",
+        "감시 폴더에 파일이 들어오면 할 일이 자동으로 완료돼요",
+        "달력의 작은 점은 그날 할 일이 있다는 뜻이에요",
+        "할 일을 우클릭하면 삭제할 수 있어요"
+    ]
+
+    @State private var currentTip: String = TipBar.tips.randomElement() ?? ""
+    private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("💡")
+            Text(currentTip)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .id(currentTip)
+                .transition(.opacity)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.windowBackgroundColor))
+        .onReceive(timer) { _ in
+            guard TipBar.tips.count > 1 else { return }
+            var next = TipBar.tips.randomElement() ?? currentTip
+            while next == currentTip {
+                next = TipBar.tips.randomElement() ?? currentTip
+            }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                currentTip = next
+            }
+        }
+    }
+}
+
 // --- 4. 메인 UI 화면 ---
 struct ContentView: View {
     @StateObject private var taskManager = TaskManager()
@@ -472,6 +515,7 @@ struct ContentView: View {
     @State private var newTaskTitle = ""
 
     var body: some View {
+        VStack(spacing: 0) {
         HStack(spacing: 0) {
             // 좌측 캘린더
             CustomCalendarView(taskManager: taskManager, selectedDate: $selectedDate)
@@ -516,30 +560,36 @@ struct ContentView: View {
                 List {
                     ForEach(taskManager.tasks.filter { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }) { task in
                         if let index = taskManager.tasks.firstIndex(where: { $0.id == task.id }) {
-                            HStack {
+                            HStack(spacing: 10) {
                                 Image(systemName: taskManager.tasks[index].isCompleted ? "checkmark.circle.fill" : "circle")
                                     .foregroundColor(taskManager.tasks[index].isCompleted ? .blue : .gray).font(.title3)
                                     .onTapGesture { taskManager.tasks[index].isCompleted.toggle() }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(task.title).strikethrough(taskManager.tasks[index].isCompleted).foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary).font(.headline)
-                                    Menu {
-                                        ForEach(taskManager.folderRules) { rule in
-                                            Button(rule.folderName) { taskManager.userPickedFolder(taskID: task.id, folder: rule.folderName) }
-                                        }
-                                        if taskManager.folderRules.isEmpty {
-                                            Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.secondary)
-                                        }
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Text("📁 자동 분류됨: \(task.targetFolder)")
-                                            Image(systemName: "chevron.down").font(.caption2)
-                                        }.font(.caption).foregroundColor(.secondary)
-                                    }
-                                    .menuStyle(.borderlessButton)
-                                    .menuIndicator(.hidden)
-                                    .fixedSize()
-                                }
+                                Text(task.title)
+                                    .strikethrough(taskManager.tasks[index].isCompleted)
+                                    .foregroundColor(taskManager.tasks[index].isCompleted ? .gray : .primary)
+                                    .font(.headline)
+                                    .lineLimit(1)
                                 Spacer()
+                                Text(task.targetFolder)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                Menu {
+                                    ForEach(taskManager.folderRules) { rule in
+                                        Button(rule.folderName) { taskManager.userPickedFolder(taskID: task.id, folder: rule.folderName) }
+                                    }
+                                    if taskManager.folderRules.isEmpty {
+                                        Text("폴더 규칙이 없습니다 — 설정에서 추가").foregroundColor(.secondary)
+                                    }
+                                } label: {
+                                    Image(systemName: "folder")
+                                        .font(.title3)
+                                        .foregroundColor(.secondary)
+                                }
+                                .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
+                                .fixedSize()
+                                .help("분류 폴더 변경")
                             }
                             .padding(.vertical, 6)
                             .contextMenu { Button(role: .destructive) { taskManager.deleteTask(id: task.id) } label: { Label("삭제", systemImage: "trash") } }
@@ -548,6 +598,9 @@ struct ContentView: View {
                 }.listStyle(.inset)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(NSColor.textBackgroundColor))
+        }
+        Divider()
+        TipBar()
         }
         .sheet(isPresented: $showSettings) { SettingsView(taskManager: taskManager) }
         .alert("Mistral 모델 다운로드 필요", isPresented: needsDownloadBinding) {
@@ -628,8 +681,13 @@ struct SettingsView: View {
     @State private var newFolderName = ""
     @State private var selectedURL: URL? = nil
     @State private var addRuleError: String? = nil
+    @State private var benchmarkRunning = false
+    @State private var benchmarkProgress = 0
+    @State private var benchmarkResult: String? = nil
+    @State private var benchmarkTask: Task<Void, Never>? = nil
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 15) {
             Text("⚙️ 감시 규칙 및 실제 폴더 연결").font(.title2).fontWeight(.bold)
 
@@ -679,13 +737,117 @@ struct SettingsView: View {
                 }.buttonStyle(.borderedProminent).disabled(newFolderName.isEmpty || selectedURL == nil)
             }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
 
+            Divider()
+            Text("속도 벤치마크").font(.headline)
+            VStack(alignment: .leading, spacing: 8) {
+                if taskManager.folderRules.count < 2 {
+                    Text("폴더 규칙이 2개 이상 있어야 분류기가 동작해요. 위에서 폴더를 추가해 주세요.")
+                        .font(.caption).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack {
+                        Button(benchmarkRunning ? "중단" : "벤치마크 실행 (\(Self.benchmarkIterations)회 랜덤)") {
+                            if benchmarkRunning {
+                                benchmarkTask?.cancel()
+                            } else {
+                                runBenchmark()
+                            }
+                        }.buttonStyle(.borderedProminent)
+                        Text("프리셋 \(Self.benchmarkPresets.count)개에서 \(Self.benchmarkIterations)개 랜덤 추출")
+                            .font(.caption2).foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    if benchmarkRunning {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("진행 \(benchmarkProgress)/\(Self.benchmarkIterations)…")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    if let result = benchmarkResult {
+                        Text(result)
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
+
             HStack { Spacer(); Button("닫기") { dismiss() }.keyboardShortcut(.escape) }
-        }.padding().frame(width: 500, height: 450)
+        }.padding()
+        }
+        .frame(width: 500, height: 600)
     }
 
     private func selectFolderFromMac() {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
         if panel.runModal() == .OK { self.selectedURL = panel.url }
+    }
+
+    private static let benchmarkIterations = 5
+    /// 벤치마크용 프리셋 task 풀. 사용자의 실제 폴더 카테고리(희곡교육론 / SW프로그래밍의기초 / 국어교과교육론)에서
+    /// 자연스럽게 나올 만한 할 일 15개. classifyTask가 실제로 LLM 추론 경로(F1.1 fast logits, F1.3 조건부 시드)를
+    /// 거치는지 확인용 — corrections에 없는 항목이라 F1.2 정확매치 단축은 거의 발동 안 함.
+    private static let benchmarkPresets: [String] = [
+        // 희곡교육론
+        "셰익스피어 작품 분석 과제",
+        "교실 연극 시나리오 정리",
+        "현대 희곡 감상문 작성",
+        "낭독극 대본 준비",
+        "연극 교육 사례 조사",
+        // SW프로그래밍의기초
+        "C언어 포인터 실습",
+        "for 반복문 연습 문제",
+        "재귀 함수 과제 풀이",
+        "배열 정렬 코드 작성",
+        "코딩 테스트 한 문제 풀기",
+        // 국어교과교육론
+        "국어 교과서 단원 분석",
+        "수업 지도안 작성",
+        "문법 단원 자료 정리",
+        "교생실습 일지 작성",
+        "국어과 교육과정 비교 정리"
+    ]
+
+    private func runBenchmark() {
+        let corrections = taskManager.corrections
+        let folders = taskManager.folderRules.map { $0.folderName }
+        guard folders.count >= 2 else { return }
+        // 매 실행마다 프리셋에서 5개 랜덤 추출 (no replacement)
+        let iterations = Array(Self.benchmarkPresets.shuffled().prefix(Self.benchmarkIterations))
+
+        benchmarkRunning = true
+        benchmarkProgress = 0
+        benchmarkResult = nil
+
+        benchmarkTask = Task { @MainActor in
+            var total = 0
+            var totalTime: Double = 0
+            let startWall = Date()
+            for title in iterations {
+                if Task.isCancelled { break }
+                // 실제 addTask 경로와 동일하게 corrections.suffix(5) 필터 적용 — 현실적인 측정
+                let context = Array(corrections.filter { folders.contains($0.folderName) }.suffix(5))
+                let t0 = Date()
+                _ = await LocalLLMService.shared.classifyTask(
+                    taskTitle: title,
+                    availableFolders: folders,
+                    corrections: context
+                )
+                let dt = Date().timeIntervalSince(t0)
+                totalTime += dt
+                total += 1
+                benchmarkProgress = total
+            }
+            let cancelled = Task.isCancelled
+            let avg = total > 0 ? totalTime / Double(total) : 0
+            let wall = Date().timeIntervalSince(startWall)
+            benchmarkResult = cancelled
+                ? String(format: "중단됨 (진행 %d/%d) · 평균 %.2fs · 누적 %.1fs",
+                         total, Self.benchmarkIterations, avg, wall)
+                : String(format: "%d회 평균 추론 시간 %.2fs · 총 %.1fs",
+                         total, avg, wall)
+            benchmarkRunning = false
+        }
     }
 }
 
