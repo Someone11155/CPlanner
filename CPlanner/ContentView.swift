@@ -565,7 +565,20 @@ struct ContentView: View {
         dismissAddTask()
     }
 
+    private func toggleSettings() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showSettings.toggle()
+        }
+    }
+
+    private func dismissSettings() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showSettings = false
+        }
+    }
+
     var body: some View {
+        ZStack {
         VStack(spacing: 0) {
         HStack(spacing: 0) {
             // 좌측 캘린더
@@ -579,7 +592,7 @@ struct ContentView: View {
                 HStack {
                     Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록").font(.title).fontWeight(.heavy)
                     Spacer()
-                    Button(action: { showSettings.toggle() }) { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.secondary) }.buttonStyle(.plain).padding(.trailing, 10)
+                    Button(action: { toggleSettings() }) { Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.secondary) }.buttonStyle(.plain).padding(.trailing, 10)
                     Button(action: { toggleAddTask() }) { Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill").font(.title).foregroundColor(isAddingTask ? .gray : .blue) }.buttonStyle(.plain)
                 }.padding(.horizontal).padding(.top, 25).padding(.bottom, 15)
 
@@ -651,7 +664,25 @@ struct ContentView: View {
         Divider()
         TipBar()
         }
-        .sheet(isPresented: $showSettings) { SettingsView(taskManager: taskManager) }
+
+        // 설정 in-window overlay — sheet 대신 ZStack overlay로 띄움:
+        // (1) 메인 윈도우 안에 들어가서 윈도우보다 커지지 않음
+        // (2) 외부(scrim) 클릭 시 자동 dismiss
+        // (3) 패널이 메인 콘텐츠 위에 dim+scale-in 트랜지션으로 등장
+        if showSettings {
+            Color.black.opacity(0.25)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { dismissSettings() }
+                .transition(.opacity)
+                .zIndex(1)
+
+            SettingsView(taskManager: taskManager, onDismiss: dismissSettings)
+                .padding(40)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .zIndex(2)
+        }
+        }
         .alert("Mistral 모델 다운로드 필요", isPresented: needsDownloadBinding) {
             Button("다운로드 (~ 4 GB)") { modelInstaller.startDownload() }
             Button("나중에", role: .cancel) { modelInstaller.skip() }
@@ -726,7 +757,9 @@ struct DownloadProgressView: View {
 // --- 5. 설정 뷰 ---
 struct SettingsView: View {
     @ObservedObject var taskManager: TaskManager
-    @Environment(\.dismiss) var dismiss
+    /// In-window overlay에서 띄우므로 sheet의 `@Environment(\.dismiss)` 대신 closure로 받음.
+    /// ContentView가 ZStack overlay로 넣으면서 동시에 외부 클릭 dismiss를 묶어 처리.
+    let onDismiss: () -> Void
     @State private var newFolderName = ""
     @State private var selectedURL: URL? = nil
     @State private var addRuleError: String? = nil
@@ -838,10 +871,16 @@ struct SettingsView: View {
                 }
             }.padding().background(Color(NSColor.controlBackgroundColor)).cornerRadius(8)
 
-            HStack { Spacer(); Button("닫기") { dismiss() }.keyboardShortcut(.escape) }
+            HStack { Spacer(); Button("닫기") { onDismiss() }.keyboardShortcut(.escape) }
         }.padding()
         }
-        .frame(width: 500, height: 600)
+        // maxWidth/maxHeight로 cap — 메인 윈도우가 작으면 패널도 그만큼 축소되어 윈도우 밖으로 안 나감.
+        .frame(maxWidth: 500, maxHeight: 600)
+        .background(Color(NSColor.windowBackgroundColor))
+        .cornerRadius(12)
+        .shadow(color: .black.opacity(0.25), radius: 30, x: 0, y: 8)
+        // 패널 위 클릭이 뒤 scrim의 onTapGesture로 빠지지 않도록 패널 전체 영역을 hit-testable로.
+        .contentShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private func selectFolderFromMac() {
