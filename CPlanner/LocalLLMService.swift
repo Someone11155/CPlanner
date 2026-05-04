@@ -41,6 +41,11 @@ actor LocalLLMService {
     private static let computeUnitsKey = "cplanner.computeUnits"
     private(set) var currentComputeUnits: MLComputeUnits = .cpuAndGPU
 
+    /// 분류 신뢰도 최소 임계값. 이 미만이면 결과를 신뢰하지 않고 "일반" 폴더로 반환.
+    /// 사용자 결정 (2026-05-04): 75%. softmax 기반이라 폴더 수가 적을수록 base rate가 높음 (3개면 33.3%).
+    /// 75%는 winner가 다른 폴더들보다 ~7-8배 확신 있을 때만 통과.
+    private static let confidenceThreshold: Double = 0.75
+
     private init() {}
 
     /// Kick off model loading. Safe to call multiple times — subsequent
@@ -142,7 +147,12 @@ actor LocalLLMService {
         llmLogger.info("[Mistral 7B] 알파벳 토큰 맵 빌드: \(map.count, privacy: .public) letters covered")
     }
 
-    func classifyTask(taskTitle: String, availableFolders: [String], corrections: [Correction] = []) async -> String {
+    /// 분류 결과 + 신뢰도. confidence는 0.0~1.0 범위.
+    /// - F1.2 exact match: 1.0 (정확매치 메모이제이션)
+    /// - F1.1 fast path: alphabet logits softmax 결과 (0~1)
+    /// - top-K fallback: 0.5 (저하된 신뢰)
+    /// - "일반" fallback: 0.0
+    func classifyTask(taskTitle: String, availableFolders: [String], corrections: [Correction] = []) async -> (folder: String, confidence: Double) {
         // F1.2 — 정확 매치 단축: 동일(정규화된) 제목의 분류 이력이 있고 그 폴더가 현재도 살아있으면 LLM 호출 생략
         // 정규화는 trim + lowercase까지만 (보수적). 공백/구두점 제거는 의도하지 않은 매치 위험.
         let normalizedNew = taskTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -150,13 +160,13 @@ actor LocalLLMService {
             let normalizedOld = c.taskTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if normalizedNew == normalizedOld, availableFolders.contains(c.folderName) {
                 llmLogger.info("[Mistral] 정확 매치 단축 — LLM 호출 생략: \(taskTitle, privacy: .public) -> \(c.folderName, privacy: .public)")
-                return c.folderName
+                return (c.folderName, 1.0)
             }
         }
 
         await ensureLoaded()
         guard let tokenizer = self.tokenizer, let model = self.monoModel else {
-            return "일반"
+            return ("일반", 0.0)
         }
 
         // Strip Mistral instruct delimiters from the user-supplied title
@@ -169,7 +179,7 @@ actor LocalLLMService {
         }
         let labels = Array(classificationLabelAlphabet.prefix(usableFolders.count))
 
-        guard !labels.isEmpty else { return "일반" }
+        guard !labels.isEmpty else { return ("일반", 0.0) }
 
         var optionsText = ""
         for (i, folder) in usableFolders.enumerated() {
@@ -229,29 +239,42 @@ actor LocalLLMService {
             }
 
             // F1.1 — Fast logits path: 알파벳 token ID들의 logits만 비교 → argmax. vocab 32K 전체 sort 회피.
+            // 신뢰도: labels에 속한 letter들의 max logit으로 softmax. 사용자 입장에선 "알파벳 N개 중 winner의 확률".
             if let logits = finalLogits, !alphabetTokenIDs.isEmpty {
-                var bestLetterIdx: Int? = nil
-                var bestScore: Float = -.greatestFiniteMagnitude
                 let logitsCount = logits.count
-                for (idx, letter) in labels.enumerated() {
-                    guard let ids = alphabetTokenIDs[letter] else { continue }
-                    for id in ids where id < logitsCount {
-                        let score = logits[id].floatValue
-                        if score > bestScore {
-                            bestScore = score
-                            bestLetterIdx = idx
+                // 각 label letter의 best logit (variants 중 최댓값)
+                var letterLogits: [Float] = []
+                letterLogits.reserveCapacity(labels.count)
+                for letter in labels {
+                    var best: Float = -.greatestFiniteMagnitude
+                    if let ids = alphabetTokenIDs[letter] {
+                        for id in ids where id < logitsCount {
+                            let s = logits[id].floatValue
+                            if s > best { best = s }
                         }
                     }
+                    letterLogits.append(best)
                 }
-                if let idx = bestLetterIdx {
-                    let result = usableFolders[idx]
-                    llmLogger.info("[Mistral] 분류 성공 (fast): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(labels[idx], privacy: .public))")
-                    return result
+                if let bestScore = letterLogits.max(), bestScore > -.greatestFiniteMagnitude,
+                   let bestIdx = letterLogits.firstIndex(of: bestScore) {
+                    // softmax — numerically stable: subtract max
+                    let expValues = letterLogits.map { Double(exp(Double($0 - bestScore))) }
+                    let sumExp = expValues.reduce(0.0, +)
+                    let confidence = sumExp > 0 ? expValues[bestIdx] / sumExp : 0.0
+                    let result = usableFolders[bestIdx]
+                    // 임계값 미만이면 결과 폐기, '일반'으로 fallback. confidence는 그대로 보존해 UI에 표시.
+                    if confidence < Self.confidenceThreshold {
+                        llmLogger.info("[Mistral] 신뢰도 부족 (\(Int(confidence * 100), privacy: .public)% < \(Int(Self.confidenceThreshold * 100), privacy: .public)%) — '일반'으로 fallback: \(sanitizedTitle, privacy: .public) (would have been \(result, privacy: .public))")
+                        return ("일반", confidence)
+                    }
+                    llmLogger.info("[Mistral] 분류 성공 (fast): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(labels[bestIdx], privacy: .public), \(Int(confidence * 100), privacy: .public)%)")
+                    return (result, confidence)
                 }
                 llmLogger.warning("[Mistral] fast path 매치 0건 — top-K fallback")
             }
 
-            // Fallback: 알파벳 맵이 비었거나 fast path 실패 시 기존 top-K 경로
+            // Fallback: 알파벳 맵이 비었거나 fast path 실패 시 기존 top-K 경로. 신뢰도는 보수적 0.5.
+            // 0.5는 confidenceThreshold(0.75) 미만이라 사실상 항상 '일반'으로 떨어짐.
             if let logits = finalLogits {
                 let topTokens = getTopK(from: logits, k: 10)
                 for token in topTokens {
@@ -261,8 +284,13 @@ actor LocalLLMService {
                                     .uppercased()
                     if clean.count == 1, let index = labels.firstIndex(of: clean) {
                         let result = usableFolders[index]
+                        let confidence = 0.5
+                        if confidence < Self.confidenceThreshold {
+                            llmLogger.info("[Mistral] 신뢰도 부족 (top-K \(Int(confidence * 100), privacy: .public)%) — '일반'으로 fallback: \(sanitizedTitle, privacy: .public) (would have been \(result, privacy: .public))")
+                            return ("일반", confidence)
+                        }
                         llmLogger.info("[Mistral] 분류 성공 (top-K): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(clean, privacy: .public))")
-                        return result
+                        return (result, confidence)
                     }
                 }
             }
@@ -271,7 +299,7 @@ actor LocalLLMService {
         }
 
         llmLogger.warning("[Mistral] 분류 실패, '일반'으로 반환")
-        return "일반"
+        return ("일반", 0.0)
     }
 
     private func getTopK(from logits: MLMultiArray, k: Int) -> [Int] {

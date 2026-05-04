@@ -21,6 +21,9 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var targetFolder: String
     var date: Date
     var eventIdentifier: String? = nil
+    /// 분류 신뢰도 0.0~1.0. nil이면 사용자 수동 분류 또는 분류 결과 없음(placeholder).
+    /// 1.0 = 정확매치 메모이제이션, 그 외는 알파벳 logits softmax 결과.
+    var classificationConfidence: Double? = nil
 }
 
 struct Correction: Codable, Equatable, Sendable {
@@ -126,10 +129,11 @@ class TaskManager: ObservableObject {
         let activeCorrections = Array(self.corrections.filter { folderNames.contains($0.folderName) }.suffix(5))
         Task { [weak self] in
             guard let self else { return }
-            let detectedFolder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folderNames, corrections: activeCorrections)
+            let (detectedFolder, confidence) = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: folderNames, corrections: activeCorrections)
             if let idx = self.tasks.firstIndex(where: { $0.id == taskID }), self.tasks[idx].targetFolder == "분류 중…" {
                 // 사용자가 그동안 폴더를 직접 골랐으면 자동 분류 결과로 덮어쓰지 않음
                 self.tasks[idx].targetFolder = detectedFolder
+                self.tasks[idx].classificationConfidence = confidence
             }
 
             if self.calendarAccessGranted, let cal = self.cplannerCalendar {
@@ -163,12 +167,15 @@ class TaskManager: ObservableObject {
     func userPickedFolder(taskID: UUID, folder: String) {
         guard let idx = tasks.firstIndex(where: { $0.id == taskID }) else { return }
         tasks[idx].targetFolder = folder
+        // 사용자가 직접 고른 결과는 신뢰도 표시에서 제외 (% 표시 안 함)
+        tasks[idx].classificationConfidence = nil
         let title = tasks[idx].title
         corrections.removeAll { $0.taskTitle == title }
         corrections.append(Correction(taskTitle: title, folderName: folder))
-        // 무한 누적 방지
-        if corrections.count > 50 {
-            corrections.removeFirst(corrections.count - 50)
+        // 안전망 — 사용자 도달 비현실적 한계지만 버그/자동누적 폭주 시 차단.
+        // 50,000 = 광적 사용 (50건/일 × 27년)에서나 도달. 도달해도 plist ~6MB라 실제 동작 가능.
+        if corrections.count > 50_000 {
+            corrections.removeFirst(corrections.count - 50_000)
         }
     }
 
@@ -353,13 +360,17 @@ class TaskManager: ObservableObject {
                 }
             } else {
                 let folder: String
+                let confidence: Double?
                 if folderRules.count >= 2 {
                     let names = folderRules.map { $0.folderName }
-                    folder = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: names)
+                    let result = await LocalLLMService.shared.classifyTask(taskTitle: title, availableFolders: names)
+                    folder = result.folder
+                    confidence = result.confidence
                 } else {
                     folder = "(미분류)"
+                    confidence = nil
                 }
-                let newTask = TaskItem(title: title, targetFolder: folder, date: normalizedDate, eventIdentifier: eid)
+                let newTask = TaskItem(title: title, targetFolder: folder, date: normalizedDate, eventIdentifier: eid, classificationConfidence: confidence)
                 resultTasks.append(newTask)
             }
         }
@@ -473,11 +484,13 @@ struct TipBar: View {
         "설정에서 폴더 감시 규칙을 추가할 수 있어요",
         "감시 폴더에 파일이 들어오면 할 일이 자동으로 완료돼요",
         "달력의 작은 점은 그날 할 일이 있다는 뜻이에요",
-        "할 일을 우클릭하면 삭제할 수 있어요"
+        "할 일을 우클릭하면 삭제할 수 있어요",
+        "폴더 옆 % 숫자는 AI의 자신감 — 낮으면 직접 확인해보세요",
+        "신뢰도 75% 미만이면 자동으로 '일반' 폴더로 분류돼요"
     ]
 
     @State private var currentTip: String = TipBar.tips.randomElement() ?? ""
-    private let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 7, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 6) {
@@ -571,7 +584,7 @@ struct ContentView: View {
                                     .font(.headline)
                                     .lineLimit(1)
                                 Spacer()
-                                Text(task.targetFolder)
+                                Text(task.classificationConfidence.map { "\(task.targetFolder) (\(Int($0 * 100))%)" } ?? task.targetFolder)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
@@ -846,7 +859,7 @@ struct SettingsView: View {
                 // 실제 addTask 경로와 동일하게 corrections.suffix(5) 필터 적용 — 현실적인 측정
                 let context = Array(corrections.filter { folders.contains($0.folderName) }.suffix(5))
                 let t0 = Date()
-                _ = await LocalLLMService.shared.classifyTask(
+                let _ = await LocalLLMService.shared.classifyTask(
                     taskTitle: title,
                     availableFolders: folders,
                     corrections: context
