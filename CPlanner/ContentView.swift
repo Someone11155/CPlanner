@@ -906,11 +906,11 @@ struct ContentView: View {
         }
         }
         .background(Color.tdmCanvas.ignoresSafeArea())
-        .alert("Mistral 모델 다운로드 필요", isPresented: needsDownloadBinding) {
-            Button("다운로드 (~ 4 GB)") { modelInstaller.startDownload() }
+        .alert("Gemma 4 E2B 모델 다운로드 필요", isPresented: needsDownloadBinding) {
+            Button("다운로드 (~ 5.5 GB)") { modelInstaller.startDownload() }
             Button("나중에", role: .cancel) { modelInstaller.skip() }
         } message: {
-            Text("Mistral 7B 모델과 토크나이저가 설치돼 있지 않아 폴더 자동 분류가 비활성 상태입니다.\nHuggingFace에서 받으시겠습니까?")
+            Text("폴더 자동 분류용 Gemma 4 E2B (CoreML) 모델이 설치돼 있지 않습니다.\nHuggingFace에서 약 5.4GB를 받습니다. 첫 실행 시 ANE 컴파일이 1~2분 추가로 걸릴 수 있습니다.")
         }
         .sheet(isPresented: isDownloadingBinding) {
             DownloadProgressView().interactiveDismissDisabled()
@@ -960,7 +960,7 @@ struct DownloadProgressView: View {
         VStack(alignment: .leading, spacing: DesignSpacing.md) {
             switch installer.state {
             case .downloading(let progress, let status):
-                Text("Mistral 모델 다운로드 중")
+                Text("Gemma 4 E2B 모델 다운로드 중")
                     .font(DesignFont.heading2())
                     .foregroundColor(.tdmInkPrimary)
                 ProgressView(value: progress)
@@ -974,13 +974,13 @@ struct DownloadProgressView: View {
                     .font(DesignFont.bodySmall())
                     .foregroundColor(.tdmInkTertiary)
             case .compiling:
-                Text("모델 컴파일 중")
+                Text("ANE 컴파일 중")
                     .font(DesignFont.heading2())
                     .foregroundColor(.tdmInkPrimary)
                 ProgressView()
                     .progressViewStyle(.linear)
                     .tint(.tdmYellow)
-                Text("CoreML이 .mlpackage를 .mlmodelc로 컴파일하고 있습니다 (수십 초~수 분 소요).")
+                Text("CoreML이 chunked decode 모델을 Apple Neural Engine에 컴파일하고 있습니다 (1~2분 소요, 결과 캐시됨).")
                     .font(DesignFont.bodySmall())
                     .foregroundColor(.tdmInkBio)
             default:
@@ -1006,9 +1006,9 @@ struct SettingsView: View {
     @State private var benchmarkProgress = 0
     @State private var benchmarkResult: String? = nil
     @State private var benchmarkTask: Task<Void, Never>? = nil
-    // 세션 한정 — UserDefaults persistence 제거됨. 앱 재시작 시 .cpuAndGPU로 시작.
-    // 2026-05-04 벤치마크에서 .cpuAndGPU가 .all보다 19% 빠름 (8.83s vs 10.88s/분류).
-    @State private var computeUnits: MLComputeUnits = .cpuAndGPU
+    // 세션 한정 — UserDefaults persistence 제거됨. 앱 재시작 시 .cpuAndNeuralEngine로 시작.
+    // Qwen3.5 2B (CoreML)는 ANE 친화적으로 설계됨 (~91% ANE residency 보고됨).
+    @State private var computeUnits: MLComputeUnits = .cpuAndNeuralEngine
 
     var body: some View {
         ScrollView {
@@ -1146,7 +1146,8 @@ struct SettingsView: View {
                 .foregroundColor(.tdmInkPrimary)
             VStack(alignment: .leading, spacing: DesignSpacing.xs) {
                 Picker("Compute Units:", selection: $computeUnits) {
-                    Text("CPU + GPU (권장)").tag(MLComputeUnits.cpuAndGPU)
+                    Text("CPU + Neural Engine (권장)").tag(MLComputeUnits.cpuAndNeuralEngine)
+                    Text("CPU + GPU").tag(MLComputeUnits.cpuAndGPU)
                     Text("ANE + GPU + CPU (.all)").tag(MLComputeUnits.all)
                 }
                 .pickerStyle(.menu)
@@ -1157,7 +1158,7 @@ struct SettingsView: View {
                 Text("바꾸면 모델 재로드 필요 — 첫 분류 전 잠시 대기")
                     .font(DesignFont.bodySmall())
                     .foregroundColor(.tdmInkTertiary)
-                Text("CPU only / ANE-only 모드는 Stateful Mistral과 호환 안 됨 (2026-05-04 확인)")
+                Text("Gemma 4 E2B는 ANE 친화적 — `.cpuAndNeuralEngine` 모드가 가장 효율적 (~91% ANE residency)")
                     .font(DesignFont.bodySmall())
                     .foregroundColor(.tdmInkTertiary)
 

@@ -91,7 +91,7 @@ struct ClassificationSettingsTab: View {
             } header: {
                 Text("자동 분류")
             } footer: {
-                Text("AI 분류 결과의 자신감이 이 값 미만이면 결과를 신뢰하지 않고 '일반' 폴더로 분류돼요. 높일수록 보수적, 낮출수록 적극적. (이 옵션은 향후 구현 예정 — 현재는 LocalLLMService에서 0.75 하드코딩)")
+                Text("Gemma 4 E2B로 전환된 후 분류 신뢰도가 이진(binary)으로 단순화됐어요 — 깨끗한 단일 알파벳 매치는 100%, 그 외는 '일반'(0%). 이 슬라이더는 향후 logit-level 신뢰도 복원 시 재활성화 예정.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }

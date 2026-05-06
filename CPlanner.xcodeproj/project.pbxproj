@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		51A0CE132F8A4D0000E2A120 /* CoreMLLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 51A0CE122F8A4D0000E2A120 /* CoreMLLLM */; };
 		51DA79162F7B9C8E00E2A120 /* Hub in Frameworks */ = {isa = PBXBuildFile; productRef = 51DA79152F7B9C8E00E2A120 /* Hub */; };
 		51DA79182F7B9C8E00E2A120 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 51DA79172F7B9C8E00E2A120 /* Tokenizers */; };
 		51DA791A2F7B9C8E00E2A120 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = 51DA79192F7B9C8E00E2A120 /* Transformers */; };
@@ -32,6 +33,7 @@
 				51DA791A2F7B9C8E00E2A120 /* Transformers in Frameworks */,
 				51DA79182F7B9C8E00E2A120 /* Tokenizers in Frameworks */,
 				51DA79162F7B9C8E00E2A120 /* Hub in Frameworks */,
+				51A0CE132F8A4D0000E2A120 /* CoreMLLLM in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -85,6 +87,7 @@
 				51DA79152F7B9C8E00E2A120 /* Hub */,
 				51DA79172F7B9C8E00E2A120 /* Tokenizers */,
 				51DA79192F7B9C8E00E2A120 /* Transformers */,
+				51A0CE122F8A4D0000E2A120 /* CoreMLLLM */,
 			);
 			productName = CPlanner;
 			productReference = 517D9BE52F74F330008C488F /* CPlanner.app */;
@@ -117,6 +120,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				51DA79142F7B9C8E00E2A120 /* XCRemoteSwiftPackageReference "swift-transformers" */,
+				51A0CE112F8A4D0000E2A120 /* XCRemoteSwiftPackageReference "CoreML-LLM" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 517D9BE62F74F330008C488F /* Products */;
@@ -414,6 +418,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		51A0CE112F8A4D0000E2A120 /* XCRemoteSwiftPackageReference "CoreML-LLM" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/john-rocky/CoreML-LLM";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.9.0;
+			};
+		};
 		51DA79142F7B9C8E00E2A120 /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/huggingface/swift-transformers";
@@ -425,6 +437,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		51A0CE122F8A4D0000E2A120 /* CoreMLLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 51A0CE112F8A4D0000E2A120 /* XCRemoteSwiftPackageReference "CoreML-LLM" */;
+			productName = CoreMLLLM;
+		};
 		51DA79152F7B9C8E00E2A120 /* Hub */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 51DA79142F7B9C8E00E2A120 /* XCRemoteSwiftPackageReference "swift-transformers" */;
