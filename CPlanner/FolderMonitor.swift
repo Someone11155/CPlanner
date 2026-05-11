@@ -46,14 +46,16 @@ final class FolderMonitor {
             queue: DispatchQueue.global(qos: .background)
         )
 
-        // 이 클래스가 더 이상 ObservableObject가 아니라 @MainActor 추론을 받지 않으므로
-        // 두 클로저 모두 기본 isolation은 nonisolated. setCancelHandler는 self를 캡처 안 하므로
-        // @Sendable 명시 가능 (future-proof). setEventHandler는 weak self를 캡처해 main으로 hop하는
-        // 패턴이라 @Sendable 명시는 non-Sendable 캡처 경고를 일으키므로 생략 — 어차피 클래스 자체가
-        // 더 이상 @MainActor가 아니라 dispatch source의 callout이 background queue에서 안전.
+        // setEventHandler 클로저는 background-qos 큐에서 발화. MainActor isolated된 `folderDidChange`
+        // 콜백을 호출하기 전에 main 스레드로 hop 후 `MainActor.assumeIsolated`로 isolation을 명시.
+        // (Task @MainActor literal은 Swift 6에서 비결정적으로 outer 클로저 prologue에 isolation 체크를
+        //  삽입해 SIGTRAP 발생 — assumeIsolated는 trampoline 없이 직접 isolation establish.)
+        // setCancelHandler는 self를 캡처 안 하므로 @Sendable 명시.
         source.setEventHandler { [weak self] in
             DispatchQueue.main.async {
-                self?.folderDidChange?()
+                MainActor.assumeIsolated {
+                    self?.folderDidChange?()
+                }
             }
         }
 

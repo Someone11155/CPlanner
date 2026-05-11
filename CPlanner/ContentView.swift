@@ -68,6 +68,9 @@ class TaskManager: ObservableObject {
         didSet { persist(corrections, forKey: Self.correctionsKey) }
     }
     @Published var lastCalendarError: String?
+    /// 시스템 공휴일 캘린더(예: 대한민국의 공휴일)에서 가져온 공휴일 정보.
+    /// 키는 `Calendar.current.startOfDay(for:)` 정규화된 Date, 값은 이벤트 title(예: "어린이날").
+    @Published var holidayNames: [Date: String] = [:]
 
     private let eventStore = EKEventStore()
     private var monitors: [UUID: (monitor: FolderMonitor, scopedURL: URL)] = [:]
@@ -157,7 +160,9 @@ class TaskManager: ObservableObject {
                     self.lastCalendarError = "캘린더 저장 실패: \(error.localizedDescription)"
                     taskManagerLogger.error("Calendar save failed: \(error.localizedDescription, privacy: .public)")
                 }
-                DispatchQueue.main.async { [weak self] in self?.isApplyingLocalChange = false }
+                DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.isApplyingLocalChange = false }
+            }
             }
         }
     }
@@ -191,7 +196,9 @@ class TaskManager: ObservableObject {
             } catch {
                 taskManagerLogger.error("Calendar delete failed: \(error.localizedDescription, privacy: .public)")
             }
-            DispatchQueue.main.async { [weak self] in self?.isApplyingLocalChange = false }
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.isApplyingLocalChange = false }
+            }
         }
         tasks.remove(at: idx)
     }
@@ -285,6 +292,7 @@ class TaskManager: ObservableObject {
             guard let cal = getOrCreateCPlannerCalendar() else { return }
             cplannerCalendar = cal
             subscribeToCalendarChanges()
+            refreshHolidays()
             await syncFromCalendar()
         } catch {
             lastCalendarError = "캘린더 권한 요청 실패: \(error.localizedDescription)"
@@ -326,9 +334,59 @@ class TaskManager: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if self.isApplyingLocalChange { return }
+                self.refreshHolidays()
                 await self.syncFromCalendar()
             }
         }
+    }
+
+    /// 시스템 공휴일 캘린더에서 가시 범위(±2년)의 공휴일 날짜를 추출하여 `holidayDates`에 저장.
+    /// 매칭은 캘린더 title 키워드 기반: "공휴일", "휴일", "holiday", "holidays".
+    /// all-day 이벤트는 endDate가 다음 날 00:00(exclusive end)이라 `< endDay`로 순회.
+    func refreshHolidays() {
+        let cals = eventStore.calendars(for: .event).filter { cal in
+            let lowered = cal.title.lowercased()
+            return cal.title.contains("공휴일") || cal.title.contains("휴일")
+                || lowered.contains("holiday") || lowered.contains("holidays")
+        }
+        guard !cals.isEmpty else {
+            holidayNames = [:]
+            return
+        }
+        let calendar = Calendar.current
+        let now = Date()
+        let start = calendar.date(byAdding: .month, value: -6, to: now) ?? now
+        let end = calendar.date(byAdding: .month, value: 24, to: now) ?? now
+        let predicate = eventStore.predicateForEvents(withStart: start, end: end, calendars: cals)
+        let events = eventStore.events(matching: predicate)
+        var names = [Date: String]()
+        for event in events {
+            let title = event.title ?? ""
+            let startDay = calendar.startOfDay(for: event.startDate)
+            let endDay = calendar.startOfDay(for: event.endDate)
+            if startDay >= endDay {
+                names[startDay] = title
+                continue
+            }
+            var cursor = startDay
+            while cursor < endDay {
+                names[cursor] = title
+                guard let next = calendar.date(byAdding: .day, value: 1, to: cursor), next > cursor else { break }
+                cursor = next
+            }
+        }
+        holidayNames = names
+    }
+
+    /// 주어진 날짜가 공휴일이면 true. 비교는 `startOfDay` 기준.
+    func isHoliday(_ date: Date) -> Bool {
+        holidayName(for: date) != nil
+    }
+
+    /// 주어진 날짜가 공휴일이면 이름(예: "어린이날")을 반환, 아니면 nil.
+    func holidayName(for date: Date) -> String? {
+        let day = Calendar.current.startOfDay(for: date)
+        return holidayNames[day]
     }
 
     private func syncFromCalendar() async {
@@ -441,21 +499,21 @@ struct CustomCalendarView: View {
             .padding(.horizontal, DesignSpacing.md)
             .padding(.vertical, DesignSpacing.md)
 
-            // 요일 행 — 일=빨강 / 토=파랑 / 평일=흰
-            Grid(horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow {
-                    ForEach(weekdayNames, id: \.self) { weekday in
-                        Text(weekday)
-                            .font(DesignFont.caption(13))
-                            .foregroundColor(
-                                weekday == "일" ? .tdmDateSunday :
-                                weekday == "토" ? .tdmDateSaturday : .tdmInkPrimary
-                            )
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 28)
-                    }
+            // 요일 행 — 일=빨강 / 토=파랑 / 평일=흰.
+            // 아래 LazyVGrid와 동일한 horizontal padding/컬럼 spec을 줘서 세로 정렬을 맞춤.
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 0) {
+                ForEach(weekdayNames, id: \.self) { weekday in
+                    Text(weekday)
+                        .font(DesignFont.caption(13))
+                        .foregroundColor(
+                            weekday == "일" ? .tdmDateSunday :
+                            weekday == "토" ? .tdmDateSaturday : .tdmInkPrimary
+                        )
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 28)
                 }
             }
+            .padding(.horizontal, DesignSpacing.xs)
 
             // 날짜 그리드 — Todomate squircle 셀. 월 변경 시 좌우 슬라이드 + 페이드 transition.
             // .id(monthKey)로 월 바뀔 때 view 재생성을 트리거 → SwiftUI가 transition 적용.
@@ -491,9 +549,10 @@ struct CustomCalendarView: View {
         let totalDots = dots.total
         let completedDots = dots.completed
 
+        let isHoliday = taskManager.isHoliday(date)
         let weekdayColor: Color =
             !inSameMonth ? Color.tdmInkTertiary :
-            weekday == 1 ? .tdmDateSunday :
+            (weekday == 1 || isHoliday) ? .tdmDateSunday :
             weekday == 7 ? .tdmDateSaturday : .tdmInkPrimary
 
         VStack(spacing: 3) {
@@ -648,9 +707,11 @@ struct TipBar: View {
             tipOpacity = 0
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + fadeOutDuration) {
-            currentTip = next
-            withAnimation(.easeOut(duration: fadeInDuration)) {
-                tipOpacity = 1
+            MainActor.assumeIsolated {
+                currentTip = next
+                withAnimation(.easeOut(duration: fadeInDuration)) {
+                    tipOpacity = 1
+                }
             }
         }
     }
@@ -798,24 +859,40 @@ struct ContentView: View {
 
             // 우측 할 일 목록
             VStack(alignment: .leading, spacing: 0) {
-                HStack {
-                    Text("\(selectedDate.formatted(.dateTime.month().day())) 과제 목록")
-                        .font(DesignFont.heading1())
-                        .foregroundColor(.tdmInkPrimary)
-                    Spacer()
-                    Button(action: { toggleSettings() }) {
-                        Image(systemName: "gearshape.fill")
-                            .font(.title2)
-                            .foregroundColor(.tdmInkSecondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    // 첫 줄: "5월 7일 (목)" — 아래 "과제 목록"(28pt)의 2/3 크기.
+                    // + 공휴일이면 우측에 이름 (날짜의 절반 크기, 회색).
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(selectedDate, formatter: DateFormatter.koreanHeaderFormatter)
+                            .font(.system(size: 28.0 * 2.0 / 3.0, weight: .bold))
+                            .foregroundColor(.tdmInkPrimary)
+                        if let holidayName = taskManager.holidayName(for: selectedDate) {
+                            // 날짜(28*2/3)의 2/3 = 28*4/9 ≈ 12.44pt.
+                            Text(holidayName)
+                                .font(.system(size: 28.0 * 4.0 / 9.0, weight: .medium))
+                                .foregroundColor(.tdmInkTertiary)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, DesignSpacing.sm)
-                    Button(action: { toggleAddTask() }) {
-                        Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill")
-                            .font(.title)
-                            .foregroundColor(isAddingTask ? .tdmInkTertiary : .tdmInkPrimary)
+                    // 둘째 줄: "과제 목록" + 같은 줄 우측에 설정/추가 아이콘 (수직 중앙 정렬).
+                    HStack(alignment: .center) {
+                        Text("과제 목록")
+                            .font(DesignFont.heading1())
+                            .foregroundColor(.tdmInkPrimary)
+                        Spacer()
+                        Button(action: { toggleSettings() }) {
+                            Image(systemName: "gearshape.fill")
+                                .font(.title2)
+                                .foregroundColor(.tdmInkSecondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, DesignSpacing.sm)
+                        Button(action: { toggleAddTask() }) {
+                            Image(systemName: isAddingTask ? "xmark.circle.fill" : "plus.circle.fill")
+                                .font(.title)
+                                .foregroundColor(isAddingTask ? .tdmInkTertiary : .tdmInkPrimary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, DesignSpacing.md)
                 .padding(.top, DesignSpacing.lg)
@@ -1300,6 +1377,14 @@ extension DateFormatter {
     static let monthYearFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "YYYY년 MM월"
+        return formatter
+    }()
+
+    /// 헤더용 한국어 날짜 + 약어 요일 (예: "5월 7일 (목)").
+    static let koreanHeaderFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.dateFormat = "M월 d일 (E)"
         return formatter
     }()
 }

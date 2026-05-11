@@ -97,26 +97,26 @@ actor LocalLLMService {
             .init(role: .system, content: "할 일의 핵심 키워드(주제 단어)를 보고 가장 의미적으로 가까운 카테고리를 선택하세요. 카테고리 라벨의 위치(A/B/C…)는 매번 다르니 letter 자체가 아니라 카테고리 이름의 의미를 보고 판단해야 합니다. 답은 정확히 대문자 한 글자만.")
         ]
 
-        if corrections.isEmpty {
-            // F1.3 — cold start seed (corrections 0개일 때만).
-            // 4개 예시로 (a) 포맷 학습 (b) 2/3-way 다양 (c) 도메인 분리 (d) letter↔domain 위치가
-            // 매번 바뀜을 학습 (예: "운동"이 A에도 C에도 등장).
-            messages.append(.init(role: .user, content: "카테고리:\nA. 운동\nB. 공부\n할 일: 헬스장 가기"))
-            messages.append(.init(role: .assistant, content: "A"))
-            messages.append(.init(role: .user, content: "카테고리:\nA. 한국어\nB. 영어\n할 일: 한글 문법 정리"))
-            messages.append(.init(role: .assistant, content: "A"))
-            messages.append(.init(role: .user, content: "카테고리:\nA. 음악\nB. 코딩\n할 일: 알고리즘 문제 풀기"))
-            messages.append(.init(role: .assistant, content: "B"))
-            messages.append(.init(role: .user, content: "카테고리:\nA. 영화\nB. 책\nC. 음식\n할 일: 라면 끓이기"))
-            messages.append(.init(role: .assistant, content: "C"))
-        } else {
-            for c in corrections {
-                guard let folderIdx = usableFolders.firstIndex(of: c.folderName) else { continue }
-                let label = labels[folderIdx]
-                let safeTitle = sanitize(c.taskTitle)
-                messages.append(.init(role: .user, content: "카테고리:\n\(optionsText)할 일: \(safeTitle)"))
-                messages.append(.init(role: .assistant, content: label))
-            }
+        // Cold-start seed (4개) — corrections 유무와 무관하게 항상 포함.
+        // 의도: (a) "대문자 한 글자만" format 학습 (b) 2/3-way 다양 (c) letter↔domain 위치가
+        // 매번 다르다(예: "운동"이 A에도 C에도 등장)는 메타 규칙 학습. 사용자 corrections 1개
+        // 만으로는 이 모두를 학습하기에 부족 — vault 05-06 측정: 1개 example = 60% / 4개 = 88%.
+        messages.append(.init(role: .user, content: "카테고리:\nA. 운동\nB. 공부\n할 일: 헬스장 가기"))
+        messages.append(.init(role: .assistant, content: "A"))
+        messages.append(.init(role: .user, content: "카테고리:\nA. 한국어\nB. 영어\n할 일: 한글 문법 정리"))
+        messages.append(.init(role: .assistant, content: "A"))
+        messages.append(.init(role: .user, content: "카테고리:\nA. 음악\nB. 코딩\n할 일: 알고리즘 문제 풀기"))
+        messages.append(.init(role: .assistant, content: "B"))
+        messages.append(.init(role: .user, content: "카테고리:\nA. 영화\nB. 책\nC. 음식\n할 일: 라면 끓이기"))
+        messages.append(.init(role: .assistant, content: "C"))
+
+        // 사용자 corrections — 도메인-specific mapping 학습용. cold-start 뒤에 덧붙임.
+        for c in corrections {
+            guard let folderIdx = usableFolders.firstIndex(of: c.folderName) else { continue }
+            let label = labels[folderIdx]
+            let safeTitle = sanitize(c.taskTitle)
+            messages.append(.init(role: .user, content: "카테고리:\n\(optionsText)할 일: \(safeTitle)"))
+            messages.append(.init(role: .assistant, content: label))
         }
         messages.append(.init(role: .user, content: "카테고리:\n\(optionsText)할 일: \(sanitizedTitle)"))
 
