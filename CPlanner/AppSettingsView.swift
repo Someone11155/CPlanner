@@ -18,12 +18,77 @@ struct AppSettingsView: View {
         TabView {
             GeneralSettingsTab()
                 .tabItem { Label("일반", systemImage: "gearshape") }
+            ModelSettingsTab()
+                .tabItem { Label("모델", systemImage: "cpu") }
             ClassificationSettingsTab()
                 .tabItem { Label("분류", systemImage: "wand.and.stars") }
             AboutTab()
                 .tabItem { Label("정보", systemImage: "info.circle") }
         }
-        .frame(width: 480, height: 320)
+        .frame(width: 480, height: 360)
+    }
+}
+
+// MARK: - 모델 (LLM Model Selection)
+
+struct ModelSettingsTab: View {
+    @ObservedObject private var installer = ModelInstaller.shared
+    @State private var showingPicker = false
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(installer.selectedKind?.displayName ?? "선택되지 않음")
+                            .font(.headline)
+                        if let kind = installer.selectedKind {
+                            Text(kind.summary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button("변경…") { showingPicker = true }
+                        .buttonStyle(.bordered)
+                }
+            } header: {
+                Text("현재 모델")
+            } footer: {
+                Text("선택한 모델은 다음 분류부터 적용됩니다. 모델 변경 시 새 모델이 다운로드되지 않았다면 다운로드(3.8~5.5GB)와 ANE 컴파일(1~2분)이 필요해요. 이전 모델 캐시는 디스크에 그대로 남습니다.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            Section {
+                ForEach(ModelKind.allCases, id: \.self) { kind in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(kind.displayName)
+                            .frame(width: 110, alignment: .leading)
+                            .font(.callout)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(kind.summary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if !kind.isAvailable {
+                                Text("다음 업데이트에서 추가 예정")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 2)
+                }
+            } header: {
+                Text("선택 가능한 모델")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+        .sheet(isPresented: $showingPicker) {
+            ModelPickerSheet(showsCancel: true)
+        }
     }
 }
 

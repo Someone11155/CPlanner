@@ -983,11 +983,14 @@ struct ContentView: View {
         }
         }
         .background(Color.tdmCanvas.ignoresSafeArea())
-        .alert("Gemma 4 E2B 모델 다운로드 필요", isPresented: needsDownloadBinding) {
-            Button("다운로드 (~ 5.5 GB)") { modelInstaller.startDownload() }
+        .sheet(isPresented: needsModelPickerBinding) {
+            ModelPickerSheet().interactiveDismissDisabled()
+        }
+        .alert(needsDownloadAlertTitle, isPresented: needsDownloadBinding) {
+            Button("다운로드 (~ \(needsDownloadSizeText))") { modelInstaller.startDownload() }
             Button("나중에", role: .cancel) { modelInstaller.skip() }
         } message: {
-            Text("폴더 자동 분류용 Gemma 4 E2B (CoreML) 모델이 설치돼 있지 않습니다.\nHuggingFace에서 약 5.4GB를 받습니다. 첫 실행 시 ANE 컴파일이 1~2분 추가로 걸릴 수 있습니다.")
+            Text(needsDownloadMessage)
         }
         .sheet(isPresented: isDownloadingBinding) {
             DownloadProgressView().interactiveDismissDisabled()
@@ -998,6 +1001,26 @@ struct ContentView: View {
         } message: {
             Text(failureMessage)
         }
+    }
+
+    private var needsModelPickerBinding: Binding<Bool> {
+        Binding(
+            get: { if case .awaitingSelection = modelInstaller.state { return true }; return false },
+            set: { _ in }
+        )
+    }
+    private var needsDownloadAlertTitle: String {
+        let name = modelInstaller.selectedKind?.displayName ?? "모델"
+        return "\(name) 모델 다운로드 필요"
+    }
+    private var needsDownloadSizeText: String {
+        guard let kind = modelInstaller.selectedKind else { return "~ GB" }
+        return String(format: "%.1f GB", kind.sizeGB)
+    }
+    private var needsDownloadMessage: String {
+        let name = modelInstaller.selectedKind?.displayName ?? "선택된 모델"
+        let size = modelInstaller.selectedKind.map { String(format: "%.1f", $0.sizeGB) } ?? "?"
+        return "폴더 자동 분류용 \(name) (CoreML) 모델이 설치돼 있지 않습니다.\nHuggingFace에서 약 \(size)GB를 받습니다. 첫 실행 시 ANE 컴파일이 1~2분 추가로 걸릴 수 있습니다."
     }
 
     private var needsDownloadBinding: Binding<Bool> {
@@ -1033,11 +1056,15 @@ struct ContentView: View {
 struct DownloadProgressView: View {
     @ObservedObject private var installer = ModelInstaller.shared
 
+    private var currentModelName: String {
+        installer.selectedKind?.displayName ?? "모델"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: DesignSpacing.md) {
             switch installer.state {
             case .downloading(let progress, let status):
-                Text("Gemma 4 E2B 모델 다운로드 중")
+                Text("\(currentModelName) 모델 다운로드 중")
                     .font(DesignFont.heading2())
                     .foregroundColor(.tdmInkPrimary)
                 ProgressView(value: progress)
@@ -1067,6 +1094,119 @@ struct DownloadProgressView: View {
         .padding(DesignSpacing.lg)
         .frame(width: 480)
         .background(Color.tdmBgMenu)
+    }
+}
+
+// --- 4-2. 모델 선택 picker (first-run + 설정 변경 공용) ---
+/// First-run: `interactiveDismissDisabled()` 와 함께 띄워 강제 선택.
+/// 설정 변경: `showsCancel: true`로 띄우면 우측 상단 ✕ 표시.
+struct ModelPickerSheet: View {
+    @ObservedObject private var installer = ModelInstaller.shared
+    @Environment(\.dismiss) private var dismiss
+    /// `true`면 우측 상단에 ✕(cancel) 버튼 표시 — 설정에서 띄울 때 사용.
+    var showsCancel: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DesignSpacing.md) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("사용할 모델을 선택하세요")
+                        .font(DesignFont.heading2())
+                        .foregroundColor(.tdmInkPrimary)
+                    Text("폴더 자동 분류용 LLM. 다운로드 후에도 설정에서 변경할 수 있어요.")
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmInkBio)
+                }
+                Spacer()
+                if showsCancel {
+                    Button(action: { dismiss() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.tdmInkTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            VStack(spacing: DesignSpacing.sm) {
+                ForEach(ModelKind.allCases, id: \.self) { kind in
+                    ModelPickerCard(
+                        kind: kind,
+                        isCurrent: installer.selectedKind == kind,
+                        onSelect: {
+                            installer.selectModel(kind)
+                            if showsCancel { dismiss() }
+                        }
+                    )
+                }
+            }
+        }
+        .padding(DesignSpacing.lg)
+        .frame(width: 540)
+        .background(Color.tdmBgMenu)
+    }
+}
+
+private struct ModelPickerCard: View {
+    let kind: ModelKind
+    let isCurrent: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(alignment: .top, spacing: DesignSpacing.md) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(kind.displayName)
+                            .font(DesignFont.heading2())
+                            .foregroundColor(.tdmInkPrimary)
+                        if isCurrent {
+                            Text("현재")
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.tdmYellow.opacity(0.25))
+                                .foregroundColor(.tdmYellow)
+                                .clipShape(Capsule())
+                        }
+                        if !kind.isAvailable {
+                            Text("곧 추가")
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.tdmInkTertiary.opacity(0.2))
+                                .foregroundColor(.tdmInkTertiary)
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Text(kind.summary)
+                        .font(DesignFont.bodySmall())
+                        .foregroundColor(.tdmInkSecondary)
+                    Text(kind.detail)
+                        .font(.caption)
+                        .foregroundColor(.tdmInkBio)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
+                    .font(.title2)
+                    .foregroundColor(isCurrent ? .tdmYellow : .tdmInkTertiary)
+            }
+            .padding(DesignSpacing.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.tdmCapsule)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isCurrent ? Color.tdmYellow : Color.clear, lineWidth: 1.5)
+            )
+            .opacity(kind.isAvailable ? 1.0 : 0.5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!kind.isAvailable)
     }
 }
 
