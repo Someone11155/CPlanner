@@ -658,7 +658,8 @@ struct CustomCalendarView: View {
 
 // --- 3-1. 하단 팁 바 ---
 struct TipBar: View {
-    static let tips: [String] = [
+    /// 모델 무관 팁 (항상 노출).
+    static let commonTips: [String] = [
         "분류 결과를 수정하려면 폴더 아이콘을 클릭하세요",
         "수동으로 분류하면 다음 자동 분류의 학습 예시로 사용돼요",
         "캘린더에서 추가한 일정도 자동으로 동기화돼요",
@@ -666,13 +667,23 @@ struct TipBar: View {
         "설정에서 폴더 감시 규칙을 추가할 수 있어요",
         "감시 폴더에 파일이 들어오면 할 일이 자동으로 완료돼요",
         "달력의 작은 점은 그날 할 일이 있다는 뜻이에요",
-        "할 일을 우클릭하면 삭제할 수 있어요",
+        "할 일을 우클릭하면 삭제할 수 있어요"
+    ]
+    /// Mistral 선택 시에만 노출되는 신뢰도 관련 팁. Gemma는 binary(1.0/0.0)라 % / threshold 개념 없음.
+    static let mistralOnlyTips: [String] = [
         "폴더 옆 % 숫자는 AI의 자신감 — 낮으면 직접 확인해보세요",
         "신뢰도 75% 미만이면 자동으로 '일반' 폴더로 분류돼요"
     ]
 
+    static func activeTips() -> [String] {
+        if ModelSelection.current == .mistral7B {
+            return commonTips + mistralOnlyTips
+        }
+        return commonTips
+    }
+
     @AppStorage("cplanner.app.tip.intervalSeconds") private var tipIntervalSeconds: Double = 7
-    @State private var currentTip: String = TipBar.tips.randomElement() ?? ""
+    @State private var currentTip: String = TipBar.activeTips().randomElement() ?? ""
     @State private var tipOpacity: Double = 1.0
 
     /// fade out (350ms easeIn) → 텍스트 swap → fade in (450ms easeOut). 시퀀셜 cross-fade라
@@ -698,10 +709,11 @@ struct TipBar: View {
     }
 
     private func rotateTip() {
-        guard TipBar.tips.count > 1 else { return }
-        var next = TipBar.tips.randomElement() ?? currentTip
+        let tips = TipBar.activeTips()
+        guard tips.count > 1 else { return }
+        var next = tips.randomElement() ?? currentTip
         while next == currentTip {
-            next = TipBar.tips.randomElement() ?? currentTip
+            next = tips.randomElement() ?? currentTip
         }
         withAnimation(.easeIn(duration: fadeOutDuration)) {
             tipOpacity = 0
@@ -811,7 +823,11 @@ struct ContentView: View {
                 .font(DesignFont.bodyMedium())
                 .lineLimit(1)
             Spacer()
-            Text(task.classificationConfidence.map { "\(task.targetFolder) (\(Int($0 * 100))%)" } ?? task.targetFolder)
+            // 신뢰도 < 100%일 때만 % 표시 — Gemma binary(1.0) / 정확매치 메모(1.0)는 안 붙임.
+            // Mistral softmax 결과는 보통 100% 미만이라 자연스럽게 노출됨.
+            Text(task.classificationConfidence
+                .flatMap { c in c < 1.0 ? "\(task.targetFolder) (\(Int(c * 100))%)" : nil }
+                ?? task.targetFolder)
                 .font(DesignFont.bodySmall())
                 .foregroundColor(.tdmInkBio)
                 .lineLimit(1)

@@ -24,6 +24,9 @@ import CoreMLLLM
 import Tokenizers
 import os
 
+// MLModel은 ObjC class로 SDK가 아직 Sendable 표시를 안 함. MistralBackend actor 안에서만 접근하므로 안전.
+extension MLModel: @retroactive @unchecked Sendable {}
+
 nonisolated(unsafe) private let llmLogger = Logger(subsystem: "com.cplanner", category: "LocalLLMService")
 
 /// 분류 라벨 후보 — 대문자 알파벳 26개. 폴더 26개 초과 시 trailing은 분류 불가능 (warning).
@@ -74,17 +77,12 @@ enum ModelKind: String, Codable, CaseIterable, Sendable {
         case .gemma4E4B:
             return "42 layers, hidden=2560. 분류 ~1~2s 예상. 더 큰 컨텍스트 이해, 어려운 입력에 더 강함. 신뢰도는 binary."
         case .mistral7B:
-            return "원조 모델. 분류 1건 ~8.8s, ANE 모드 hang 가능 → CPU+GPU 권장. softmax 신뢰도(0~100%) 노출. (다음 업데이트에서 추가 예정)"
+            return "원조 모델. 분류 1건 ~8.8s, ANE 모드 hang 가능 → CPU+GPU 권장. softmax 신뢰도(0~100%) 노출."
         }
     }
 
-    /// Phase 1+2에서 활성화된 모델만 true. Mistral은 Phase 3에서 활성화.
-    nonisolated var isAvailable: Bool {
-        switch self {
-        case .gemma4E2B, .gemma4E4B: return true
-        case .mistral7B: return false
-        }
-    }
+    /// 사용 가능한 모델. Phase 3 (2026-05-12)에서 Mistral도 활성화.
+    nonisolated var isAvailable: Bool { true }
 
     /// 각 모델에 권장되는 기본 compute units.
     nonisolated var defaultComputeUnits: MLComputeUnits {
@@ -206,6 +204,199 @@ actor GemmaBackend: LLMBackend {
             .replacingOccurrences(of: "<end_of_turn>", with: "")
             .replacingOccurrences(of: "<bos>", with: "")
             .replacingOccurrences(of: "<eos>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - Mistral backend
+
+/// Mistral 7B Instruct v0.3 (apple/mistral-coreml int4 stateful 변종).
+/// 라이브러리(`john-rocky/CoreML-LLM`)가 Mistral 미지원이라 raw `MLModel` + `MLState` 직접 운용.
+///
+/// **Inference 경로:** prompt를 토큰 단위로 prefill (state 누적) → 마지막 토큰 위치의 logits 추출
+/// → 알파벳 letter token IDs(SentencePiece variants 포함)에 대해서만 logit 비교 → softmax로 신뢰도.
+///
+/// **신뢰도 semantics:** softmax over labels-only (vocab 32K 전체가 아님) — 사용자 입장에선
+/// "후보 폴더 N개 중 winner의 상대적 확신도". 75% threshold 미만이면 결과 폐기 + "일반"으로 fallback.
+///
+/// 옛 commit `8267940`의 `LocalLLMService.classifyTask` 220줄을 actor화. F1.2 정확매치 단축은
+/// `LocalLLMService` coordinator 쪽에서 처리하므로 여기선 logits 경로만 담당.
+@available(macOS 15.0, iOS 18.0, *)
+actor MistralBackend: LLMBackend {
+    nonisolated let kind: ModelKind = .mistral7B
+
+    private let tokenizer: Tokenizer
+    private let model: MLModel
+    /// SentencePiece 변형(`A`, ` A`, `▁A`, `\nA`)으로 인코딩한 letter→token ID 후보 맵.
+    /// classify에서 logits[id]만 비교하면 vocab 전체 sort 없이 argmax 가능.
+    private let alphabetTokenIDs: [String: [Int]]
+
+    /// 사용자 결정 (2026-05-04): softmax winner가 다른 폴더들보다 ~7-8배 확신 있을 때만 통과.
+    nonisolated private static let confidenceThreshold: Double = 0.75
+
+    init(tokenizer: Tokenizer, model: MLModel) {
+        self.tokenizer = tokenizer
+        self.model = model
+        var map: [String: [Int]] = [:]
+        for letter in classificationLabelAlphabet {
+            var ids = Set<Int>()
+            // SentencePiece는 위치/공백 prefix에 따라 다른 token ID. 후보 폭넓게.
+            let variants = [letter, " " + letter, "\n" + letter, "▁" + letter]
+            for v in variants {
+                let tokens = tokenizer.encode(text: v)
+                if tokens.count == 1 {
+                    ids.insert(tokens[0])
+                } else if tokens.count == 2 {
+                    // BOS + letter token 케이스
+                    ids.insert(tokens[1])
+                }
+            }
+            if !ids.isEmpty { map[letter] = Array(ids) }
+        }
+        self.alphabetTokenIDs = map
+        llmLogger.info("[Mistral 7B] 알파벳 토큰 맵 빌드: \(map.count, privacy: .public) letters covered")
+    }
+
+    func classify(taskTitle: String, availableFolders: [String], corrections: [Correction]) async -> (folder: String, confidence: Double) {
+        let usableFolders = Array(availableFolders.prefix(classificationLabelAlphabet.count))
+        if availableFolders.count > usableFolders.count {
+            llmLogger.warning("폴더가 26개를 초과 — 후행 폴더는 분류 불가능.")
+        }
+        let labels = Array(classificationLabelAlphabet.prefix(usableFolders.count))
+        guard !labels.isEmpty else { return ("일반", 0.0) }
+
+        let sanitizedTitle = sanitize(taskTitle)
+        var optionsText = ""
+        for (i, folder) in usableFolders.enumerated() {
+            optionsText += "\(labels[i]). \(folder)\n"
+        }
+
+        // 사용자 corrections few-shot
+        var fewShotExamples = ""
+        for c in corrections {
+            guard let folderIdx = usableFolders.firstIndex(of: c.folderName) else { continue }
+            let label = labels[folderIdx]
+            let safeTitle = sanitize(c.taskTitle)
+            fewShotExamples += "[INST] 카테고리:\n\(optionsText)할 일: \(safeTitle) [/INST] \(label) </s> "
+        }
+
+        // F1.3 — corrections가 있으면 cold-start seed 생략 (corrections가 format demonstration 충분).
+        // corrections == 0인 cold start만 시드 유지.
+        let staticSeed = corrections.isEmpty
+            ? "[INST] 분류 전문가로서 할 일을 카테고리 중 하나로 분류하세요. 대문자 알파벳 한 글자만 답하세요.\n카테고리:\nA. 운동\nB. 공부\n할 일: 헬스장 가기 [/INST] A </s> "
+            : ""
+
+        let prompt = """
+        \(staticSeed)\(fewShotExamples)[INST] 카테고리:
+        \(optionsText)
+        할 일: \(sanitizedTitle) [/INST]
+        """
+
+        let inputTokens = tokenizer.encode(text: prompt)
+
+        do {
+            let state = model.makeState()
+            var finalLogits: MLMultiArray?
+
+            for (i, tokenID) in inputTokens.enumerated() {
+                let inputIdsMA = try MLMultiArray(shape: [1, 1], dataType: .int32)
+                inputIdsMA[0] = NSNumber(value: Int32(tokenID))
+
+                // causalMask: fp16 [1, 1, 1, keyLen], 모든 위치 0 (마스크 없음)
+                let keyLen = i + 1
+                let maskMA = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: keyLen)], dataType: .float16)
+                let maskBytes = maskMA.dataPointer.bindMemory(to: UInt16.self, capacity: keyLen)
+                for j in 0..<keyLen { maskBytes[j] = 0 }
+
+                let inputs: [String: Any] = [
+                    "inputIds": inputIdsMA,
+                    "causalMask": maskMA
+                ]
+
+                let provider = try MLDictionaryFeatureProvider(dictionary: inputs)
+                let prediction = try await model.prediction(from: provider, using: state)
+
+                if i == inputTokens.count - 1 {
+                    finalLogits = prediction.featureValue(for: "logits")?.multiArrayValue
+                }
+            }
+
+            // F1.1 — Fast logits path: 알파벳 token IDs만 비교 → argmax + softmax.
+            if let logits = finalLogits, !alphabetTokenIDs.isEmpty {
+                let logitsCount = logits.count
+                var letterLogits: [Float] = []
+                letterLogits.reserveCapacity(labels.count)
+                for letter in labels {
+                    var best: Float = -.greatestFiniteMagnitude
+                    if let ids = alphabetTokenIDs[letter] {
+                        for id in ids where id < logitsCount {
+                            let s = logits[id].floatValue
+                            if s > best { best = s }
+                        }
+                    }
+                    letterLogits.append(best)
+                }
+                if let bestScore = letterLogits.max(), bestScore > -.greatestFiniteMagnitude,
+                   let bestIdx = letterLogits.firstIndex(of: bestScore) {
+                    // softmax — numerically stable: subtract max
+                    let expValues = letterLogits.map { Double(exp(Double($0 - bestScore))) }
+                    let sumExp = expValues.reduce(0.0, +)
+                    let confidence = sumExp > 0 ? expValues[bestIdx] / sumExp : 0.0
+                    let result = usableFolders[bestIdx]
+                    if confidence < Self.confidenceThreshold {
+                        llmLogger.info("[Mistral 7B] 신뢰도 부족 (\(Int(confidence * 100), privacy: .public)% < \(Int(Self.confidenceThreshold * 100), privacy: .public)%) — '일반'으로 fallback: \(sanitizedTitle, privacy: .public) (would have been \(result, privacy: .public))")
+                        return ("일반", confidence)
+                    }
+                    llmLogger.info("[Mistral 7B] 분류 성공 (fast): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(labels[bestIdx], privacy: .public), \(Int(confidence * 100), privacy: .public)%)")
+                    return (result, confidence)
+                }
+                llmLogger.warning("[Mistral 7B] fast path 매치 0건 — top-K fallback")
+            }
+
+            // Fallback: 알파벳 맵이 비었거나 fast path 실패 시 top-K 탐색. 신뢰도 보수적 0.5 → threshold 미만 → 일반.
+            if let logits = finalLogits {
+                let topTokens = getTopK(from: logits, k: 10)
+                for token in topTokens {
+                    let word = tokenizer.decode(tokens: [token])
+                    let clean = word.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .trimmingCharacters(in: .punctuationCharacters)
+                                    .uppercased()
+                    if clean.count == 1, let index = labels.firstIndex(of: clean) {
+                        let result = usableFolders[index]
+                        let confidence = 0.5
+                        if confidence < Self.confidenceThreshold {
+                            llmLogger.info("[Mistral 7B] 신뢰도 부족 (top-K \(Int(confidence * 100), privacy: .public)%) — '일반'으로 fallback: \(sanitizedTitle, privacy: .public)")
+                            return ("일반", confidence)
+                        }
+                        llmLogger.info("[Mistral 7B] 분류 성공 (top-K): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public)")
+                        return (result, confidence)
+                    }
+                }
+            }
+        } catch {
+            llmLogger.error("[Mistral 7B] 추론 에러: \(error.localizedDescription, privacy: .public)")
+        }
+
+        llmLogger.warning("[Mistral 7B] 분류 실패, '일반' 반환")
+        return ("일반", 0.0)
+    }
+
+    private func getTopK(from logits: MLMultiArray, k: Int) -> [Int] {
+        var topTokens = [(index: Int, score: Float)]()
+        topTokens.reserveCapacity(logits.count)
+        for i in 0..<logits.count {
+            topTokens.append((index: i, score: logits[i].floatValue))
+        }
+        topTokens.sort { $0.score > $1.score }
+        return topTokens.prefix(k).map { $0.index }
+    }
+
+    private func sanitize(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "[INST]", with: "")
+            .replacingOccurrences(of: "[/INST]", with: "")
+            .replacingOccurrences(of: "<s>", with: "")
+            .replacingOccurrences(of: "</s>", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

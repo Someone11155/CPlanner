@@ -21,6 +21,8 @@ import Foundation
 import Combine
 import CoreML
 import CoreMLLLM
+@preconcurrency import Hub
+import Tokenizers
 import os
 
 @MainActor
@@ -62,8 +64,7 @@ final class ModelInstaller: ObservableObject {
         }
         selectedKind = stored
         computeUnits = stored.defaultComputeUnits
-        if let info = Self.modelInfo(for: stored),
-           ModelDownloader.shared.localModelURL(for: info) != nil {
+        if cacheReady(for: stored) {
             logger.info("\(stored.displayName, privacy: .public) already downloaded — loading.")
             state = .checking
             Task { await loadModel() }
@@ -73,7 +74,20 @@ final class ModelInstaller: ObservableObject {
         }
     }
 
-    /// 사용자가 picker에서 모델 선택 (first-run 또는 설정에서 변경). 비활성 모델(Phase 3 대기)은 거부.
+    /// 모델별 캐시 존재 확인.
+    /// - Gemma: 라이브러리(`john-rocky/CoreML-LLM`)의 `ModelDownloader.localModelURL(for:)`.
+    /// - Mistral: `applicationSupportDirectory`에 토크나이저 + 컴파일된 `.mlmodelc`.
+    private func cacheReady(for kind: ModelKind) -> Bool {
+        switch kind {
+        case .gemma4E2B, .gemma4E4B:
+            guard let info = Self.modelInfo(for: kind) else { return false }
+            return ModelDownloader.shared.localModelURL(for: info) != nil
+        case .mistral7B:
+            return Self.mistralResolveLocation() != nil
+        }
+    }
+
+    /// 사용자가 picker에서 모델 선택 (first-run 또는 설정에서 변경).
     func selectModel(_ kind: ModelKind) {
         guard kind.isAvailable else {
             logger.warning("\(kind.displayName, privacy: .public) not yet available — ignored.")
@@ -88,15 +102,11 @@ final class ModelInstaller: ObservableObject {
             if isSwitch {
                 await LocalLLMService.shared.detachBackend()
             }
-            // 이미 다운로드돼 있으면 바로 load, 아니면 다운로드 진행.
-            if let info = Self.modelInfo(for: kind),
-               ModelDownloader.shared.localModelURL(for: info) != nil {
+            // 이미 다운로드돼 있으면 바로 load, 아니면 picker 자체가 download consent.
+            if cacheReady(for: kind) {
                 state = .checking
-                await loadModel()
-            } else {
-                // picker 자체가 download consent라 즉시 다운로드 시작.
-                await loadModel()
             }
+            await loadModel()
         }
     }
 
@@ -138,9 +148,18 @@ final class ModelInstaller: ObservableObject {
             state = .awaitingSelection
             return
         }
+        switch kind {
+        case .gemma4E2B, .gemma4E4B:
+            await loadGemmaBackend(kind: kind)
+        case .mistral7B:
+            await loadMistralBackend()
+        }
+    }
+
+    private func loadGemmaBackend(kind: ModelKind) async {
         guard let info = Self.modelInfo(for: kind) else {
-            logger.error("\(kind.displayName, privacy: .public) load path not implemented yet (Phase 3).")
-            state = .failed(message: "\(kind.displayName)은 다음 업데이트에서 추가 예정입니다.")
+            logger.error("\(kind.displayName, privacy: .public) ModelInfo 매핑 누락.")
+            state = .failed(message: "\(kind.displayName) 매핑이 없습니다.")
             return
         }
         state = .downloading(progress: 0.0, statusText: "\(kind.displayName) 준비 중…")
@@ -195,5 +214,281 @@ final class ModelInstaller: ObservableObject {
             progress = 0.0
         }
         state = .downloading(progress: progress, statusText: message)
+    }
+
+    // MARK: - Mistral install / load (라이브러리 미지원이라 별도 경로)
+    // 클래스 자체는 @MainActor라 상수도 기본 isolated → resolveLocation 등 nonisolated 컨텍스트 + Sendable 클로저에서 접근하려면 nonisolated 명시.
+
+    nonisolated private static let mistralModelRepo = "apple/mistral-coreml"
+    nonisolated private static let mistralTokenizerRepo = "mistralai/Mistral-7B-Instruct-v0.3"
+    nonisolated private static let mistralPackageName = "StatefulMistral7BInstructInt4.mlpackage"
+    nonisolated private static let mistralCompiledName = "StatefulMistral7BInstructInt4.mlmodelc"
+    nonisolated private static let mistralTokenizerFiles = [
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer.model.v3",
+        "tokenizer_config.json"
+    ]
+    /// 모델이 다운로드 데이터의 ~99% — 진행 바를 데이터 비율에 맞춰 가중.
+    nonisolated private static let mistralModelWeight: Double = 0.95
+    nonisolated private static let mistralTokenizerWeight: Double = 0.05
+
+    /// `~/Library/Application Support/CPlanner/`. 옛 commit `8267940`의 위치와 동일.
+    nonisolated static var mistralAppSupportDirectory: URL {
+        let fm = FileManager.default
+        let base: URL = (try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        let dir = base.appendingPathComponent("CPlanner", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// 토크나이저 + 컴파일된 .mlmodelc가 동시에 있는 디렉터리 반환. 번들 우선, 없으면 App Support.
+    nonisolated static func mistralResolveLocation() -> URL? {
+        let fm = FileManager.default
+        let tokenizerOK: (URL) -> Bool = { dir in
+            ["tokenizer.json", "tokenizer_config.json"].allSatisfy {
+                fm.fileExists(atPath: dir.appendingPathComponent($0).path)
+            }
+        }
+        let compiledOK: (URL) -> Bool = { dir in
+            var isDir: ObjCBool = false
+            let url = dir.appendingPathComponent(mistralCompiledName)
+            return fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+        }
+        if let bundle = Bundle.main.resourceURL, tokenizerOK(bundle), compiledOK(bundle) {
+            return bundle
+        }
+        let appSupport = mistralAppSupportDirectory
+        if tokenizerOK(appSupport), compiledOK(appSupport) {
+            return appSupport
+        }
+        return nil
+    }
+
+    /// 압축 패키지(.mlpackage)는 받았으나 아직 .mlmodelc로 컴파일 안 된 상태.
+    private nonisolated static func mistralHasUnpackedPackage() -> Bool {
+        let fm = FileManager.default
+        let dir = mistralAppSupportDirectory
+        let manifest = dir.appendingPathComponent(mistralPackageName).appendingPathComponent("Manifest.json")
+        let tokenizerOK = ["tokenizer.json", "tokenizer_config.json"].allSatisfy {
+            fm.fileExists(atPath: dir.appendingPathComponent($0).path)
+        }
+        return fm.fileExists(atPath: manifest.path) && tokenizerOK
+    }
+
+    /// Mistral 백엔드 전체 경로 — 캐시 hit 시 즉시 로드, 미설치 시 다운로드 → 컴파일 → 로드.
+    private func loadMistralBackend() async {
+        // 이미 캐시 있으면 다운로드/컴파일 스킵.
+        if let location = Self.mistralResolveLocation() {
+            await mistralAttach(from: location)
+            return
+        }
+        // .mlpackage 받아놨지만 컴파일 안 된 케이스 (이전 세션 중단).
+        if Self.mistralHasUnpackedPackage() {
+            state = .compiling
+            do {
+                try await mistralCompilePackage()
+            } catch {
+                logger.error("Mistral compile failed: \(error.localizedDescription, privacy: .public)")
+                state = .failed(message: "Mistral 컴파일 실패: \(error.localizedDescription)")
+                return
+            }
+            if let location = Self.mistralResolveLocation() {
+                await mistralAttach(from: location)
+            } else {
+                state = .failed(message: "컴파일 후에도 Mistral 파일 검증 실패")
+            }
+            return
+        }
+
+        // 완전 신규 다운로드.
+        state = .downloading(progress: 0.0, statusText: "Mistral 7B 모델 준비 중…")
+        do {
+            try await mistralDownloadModel()
+            try await mistralDownloadTokenizer()
+        } catch {
+            let msg: String
+            if let hubError = error as? Hub.HubClientError, case .authorizationRequired = hubError {
+                msg = "모델 저장소 접근 권한 거부 — HuggingFace 토큰이 필요할 수 있습니다."
+            } else {
+                msg = "Mistral 다운로드 실패: \(error.localizedDescription)"
+            }
+            logger.error("Mistral download failed: \(error.localizedDescription, privacy: .public)")
+            state = .failed(message: msg)
+            return
+        }
+
+        state = .compiling
+        do {
+            try await mistralCompilePackage()
+        } catch {
+            logger.error("Mistral compile failed: \(error.localizedDescription, privacy: .public)")
+            state = .failed(message: "Mistral 컴파일 실패: \(error.localizedDescription)")
+            return
+        }
+        guard let location = Self.mistralResolveLocation() else {
+            state = .failed(message: "컴파일 후에도 Mistral 파일 검증 실패")
+            return
+        }
+        await mistralAttach(from: location)
+    }
+
+    private func mistralAttach(from location: URL) async {
+        do {
+            let tokenizer = try await AutoTokenizer.from(modelFolder: location)
+            let config = MLModelConfiguration()
+            config.computeUnits = computeUnits
+            let modelURL = location.appendingPathComponent(Self.mistralCompiledName)
+            let model = try MLModel(contentsOf: modelURL, configuration: config)
+            let backend = MistralBackend(tokenizer: tokenizer, model: model)
+            await LocalLLMService.shared.attachBackend(backend, computeUnits: computeUnits)
+            logger.info("Mistral 7B loaded from \(location.path, privacy: .public). units=\(self.computeUnits.label, privacy: .public)")
+            state = .ready
+        } catch {
+            logger.error("Mistral attach failed: \(error.localizedDescription, privacy: .public)")
+            state = .failed(message: "Mistral 로드 실패: \(error.localizedDescription)")
+        }
+    }
+
+    private func mistralDownloadModel() async throws {
+        let appSupport = Self.mistralAppSupportDirectory
+        let hubBase = appSupport.appendingPathComponent("hub", isDirectory: true)
+        try FileManager.default.createDirectory(at: hubBase, withIntermediateDirectories: true)
+
+        let api = HubApi(downloadBase: hubBase)
+        let repo = Hub.Repo(id: Self.mistralModelRepo)
+        let glob = "\(Self.mistralPackageName)/*"
+
+        let snapshotURL = try await api.snapshot(from: repo, matching: [glob]) { @Sendable progress in
+            let frac = progress.fractionCompleted
+            let stat = "Mistral 모델 다운로드 중 — \(Int(frac * 100))%"
+            let overall = frac * Self.mistralModelWeight
+            Task { @MainActor in
+                ModelInstaller.shared.state = .downloading(progress: overall, statusText: stat)
+            }
+        }
+
+        // Hub은 <hubBase>/models/<repo.id>/ 안에 받음. .mlpackage를 AppSupport 루트로 이동.
+        let downloadedPackage = snapshotURL.appendingPathComponent(Self.mistralPackageName)
+        let destPackage = appSupport.appendingPathComponent(Self.mistralPackageName)
+        if FileManager.default.fileExists(atPath: destPackage.path) {
+            try FileManager.default.removeItem(at: destPackage)
+        }
+        try FileManager.default.moveItem(at: downloadedPackage, to: destPackage)
+        try? FileManager.default.removeItem(at: hubBase)
+    }
+
+    private func mistralDownloadTokenizer() async throws {
+        let dest = Self.mistralAppSupportDirectory
+        let total = Self.mistralTokenizerFiles.count
+        let perWeight = Self.mistralTokenizerWeight / Double(total)
+        for (i, name) in Self.mistralTokenizerFiles.enumerated() {
+            let baseProgress = Self.mistralModelWeight + Double(i) * perWeight
+            state = .downloading(progress: baseProgress, statusText: "토크나이저 (\(i + 1)/\(total)): \(name)")
+
+            let url = URL(string: "https://huggingface.co/\(Self.mistralTokenizerRepo)/resolve/main/\(name)")!
+            let destURL = dest.appendingPathComponent(name)
+            try await mistralDownloadFile(url: url, destination: destURL) { written, expected in
+                let perFile: Double = expected > 0 ? Double(written) / Double(expected) : 0
+                let overall = baseProgress + perFile * perWeight
+                let kb = Double(written) / 1024
+                let stat: String
+                if expected > 0 {
+                    let totalKB = Double(expected) / 1024
+                    stat = "토크나이저 (\(i + 1)/\(total)): \(name) — \(Int(kb))/\(Int(totalKB)) KB"
+                } else {
+                    stat = "토크나이저 (\(i + 1)/\(total)): \(name) — \(Int(kb)) KB"
+                }
+                Task { @MainActor [weak self] in
+                    self?.state = .downloading(progress: overall, statusText: stat)
+                }
+            }
+        }
+    }
+
+    private func mistralCompilePackage() async throws {
+        let appSupport = Self.mistralAppSupportDirectory
+        let packageURL = appSupport.appendingPathComponent(Self.mistralPackageName)
+        let tempCompiled = try await MLModel.compileModel(at: packageURL)
+        let stableURL = appSupport.appendingPathComponent(Self.mistralCompiledName)
+        if FileManager.default.fileExists(atPath: stableURL.path) {
+            try FileManager.default.removeItem(at: stableURL)
+        }
+        try FileManager.default.moveItem(at: tempCompiled, to: stableURL)
+    }
+
+    private func mistralDownloadFile(url: URL,
+                                     destination: URL,
+                                     progress: @escaping (Int64, Int64) -> Void) async throws {
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        let delegate = HFDownloadDelegate(progressHandler: progress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let temp: URL
+        do {
+            temp = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+                delegate.continuation = cont
+                session.downloadTask(with: url).resume()
+            }
+        } catch {
+            session.invalidateAndCancel()
+            throw error
+        }
+        session.finishTasksAndInvalidate()
+        try FileManager.default.moveItem(at: temp, to: destination)
+    }
+}
+
+private final class HFDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    var continuation: CheckedContinuation<URL, Error>?
+    private let progressHandler: (Int64, Int64) -> Void
+
+    init(progressHandler: @escaping (Int64, Int64) -> Void) {
+        self.progressHandler = progressHandler
+    }
+
+    func urlSession(_ session: URLSession,
+                    downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        progressHandler(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(_ session: URLSession,
+                    downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = (try? String(contentsOf: location, encoding: .utf8)) ?? ""
+            try? FileManager.default.removeItem(at: location)
+            let snippet = body.prefix(200)
+            let msg = "HTTP \(http.statusCode)" + (snippet.isEmpty ? "" : " — \(snippet)")
+            continuation?.resume(throwing: NSError(domain: "ModelInstaller",
+                                                   code: http.statusCode,
+                                                   userInfo: [NSLocalizedDescriptionKey: msg]))
+            continuation = nil
+            return
+        }
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        do {
+            try FileManager.default.moveItem(at: location, to: temp)
+            continuation?.resume(returning: temp)
+        } catch {
+            continuation?.resume(throwing: error)
+        }
+        continuation = nil
+    }
+
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        if let error, let cont = continuation {
+            cont.resume(throwing: error)
+            continuation = nil
+        }
     }
 }
