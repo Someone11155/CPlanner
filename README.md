@@ -1,6 +1,6 @@
 # Cplanner
 
-> ⚠️ **하다가 유기한 프로젝트입니다.** 더 이상 개발/유지보수되지 않습니다.
+> ⚠️ **유기된 프로젝트입니다.** 더 이상 개발/유지보수되지 않습니다.
 
 AI-powered planner app for university students using local LLM.
 
