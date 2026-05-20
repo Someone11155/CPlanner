@@ -11,12 +11,17 @@ import os
 
 private let folderMonitorLogger = Logger(subsystem: "com.cplanner", category: "FolderMonitor")
 
-/// 폴더 변경 감시기. **`ObservableObject`를 의도적으로 채택하지 않음** — Swift 6 strict concurrency가
-/// `ObservableObject` 클래스를 암시적 `@MainActor`로 추론하면 내부의 모든 클로저(특히
-/// `DispatchSource`에 넘기는 cancel/event handler)가 `@MainActor` 상속을 받아, 그 dispatch source가
-/// background queue에서 callout을 호출할 때 `_swift_task_checkIsolatedSwift` 어설션이 발동해서
-/// `_dispatch_assert_queue_fail`로 SIGTRAP. (실제로 사용자가 폴더 삭제 시 재현된 크래시.)
-/// 이 클래스는 `@Published` 프로퍼티가 없어 ObservableObject가 필요하지 않음.
+/// 폴더 변경 감시기.
+///
+/// **격리 모델 (이 패턴을 깨면 `_dispatch_assert_queue_fail` SIGTRAP 재발):**
+/// - 클래스는 `@MainActor` — 상태(`dispatchSource`, `folderDidChange`)는 main에 격리되고 Sendable.
+/// - 단, `DispatchSource`에 넘기는 **event/cancel handler는 반드시 `@Sendable`** (nonisolated). 빌드 설정이
+///   `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`라 `@Sendable`를 빼면 핸들러가 `@MainActor`로 추론되고,
+///   Swift 6가 그 prologue에 executor 체크(`dispatch_assert_queue(main)`)를 넣는다. dispatch source는
+///   핸들러를 background-qos 큐에서 callout하므로 단언 실패 → SIGTRAP. (`@Sendable`면 체크 없음.)
+/// - main 격리 상태(`folderDidChange`)는 `@Sendable` 핸들러 안에서 `DispatchQueue.main.async` +
+///   `MainActor.assumeIsolated`로 hop 후 접근. `@ObservableObject`는 채택 안 함 (`@Published` 불필요).
+@MainActor
 final class FolderMonitor {
     private let folderURL: URL
     private var dispatchSource: DispatchSourceFileSystemObject?
@@ -46,12 +51,14 @@ final class FolderMonitor {
             queue: DispatchQueue.global(qos: .background)
         )
 
-        // setEventHandler 클로저는 background-qos 큐에서 발화. MainActor isolated된 `folderDidChange`
-        // 콜백을 호출하기 전에 main 스레드로 hop 후 `MainActor.assumeIsolated`로 isolation을 명시.
-        // (Task @MainActor literal은 Swift 6에서 비결정적으로 outer 클로저 prologue에 isolation 체크를
-        //  삽입해 SIGTRAP 발생 — assumeIsolated는 trampoline 없이 직접 isolation establish.)
-        // setCancelHandler는 self를 캡처 안 하므로 @Sendable 명시.
-        source.setEventHandler { [weak self] in
+        // **event/cancel handler 둘 다 `@Sendable` 필수.** 빌드 설정이
+        // `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`라서, `@Sendable`를 안 붙이면 이 클로저들이
+        // 자동으로 `@MainActor`로 추론된다. Swift 6는 `@MainActor` 클로저 prologue에 executor 체크
+        // (`dispatch_assert_queue(main)`)를 삽입하는데, dispatch source는 이 핸들러를 background-qos
+        // 큐에서 callout → 단언 실패 → `_dispatch_assert_queue_fail` → SIGTRAP. (크래시는 body 진입
+        // 전 prologue에서 발생하므로 안쪽 hop으로는 못 막는다.) `@Sendable`로 nonisolated화해서 체크 제거.
+        // 그 뒤 main으로 hop + `MainActor.assumeIsolated`로 `folderDidChange`(MainActor) 호출을 establish.
+        source.setEventHandler { @Sendable [weak self] in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     self?.folderDidChange?()
