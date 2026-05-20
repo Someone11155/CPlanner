@@ -55,7 +55,7 @@ enum ModelKind: String, Codable, CaseIterable, Sendable {
     nonisolated var sizeGB: Double {
         switch self {
         case .gemma4E2B: return 5.4
-        case .gemma4E4B: return 5.5
+        case .gemma4E4B: return 7.7
         case .mistral7B: return 3.8
         }
     }
@@ -64,7 +64,7 @@ enum ModelKind: String, Codable, CaseIterable, Sendable {
     nonisolated var summary: String {
         switch self {
         case .gemma4E2B: return "빠름 · ANE 최적화 · 5.4GB"
-        case .gemma4E4B: return "더 정확 · 더 큰 모델 · 5.5GB"
+        case .gemma4E4B: return "더 정확 · prefill 가속 · 7.7GB"
         case .mistral7B: return "신뢰도 % 표시 · 다소 느림 · 3.8GB"
         }
     }

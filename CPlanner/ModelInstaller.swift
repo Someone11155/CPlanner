@@ -75,15 +75,70 @@ final class ModelInstaller: ObservableObject {
     }
 
     /// 모델별 캐시 존재 확인.
-    /// - Gemma: 라이브러리(`john-rocky/CoreML-LLM`)의 `ModelDownloader.localModelURL(for:)`.
+    /// - Gemma E2B: 라이브러리(`john-rocky/CoreML-LLM`)의 `ModelDownloader.localModelURL(for:)`.
+    /// - Gemma E4B: prefill chunk 포함 풀번들(`<App Support>/CPlanner/gemma-4-e4b/`)이 다 있을 때만 ready.
+    ///   미설치면 `downloadGemma4E4BBundle()`이 HF `someone15/gemma-4-E4B-coreml`에서 받아옴.
+    ///   (라이브러리 download path는 prefill 부재 → 17× 느림이라 사용 안 함.)
     /// - Mistral: `applicationSupportDirectory`에 토크나이저 + 컴파일된 `.mlmodelc`.
     private func cacheReady(for kind: ModelKind) -> Bool {
         switch kind {
-        case .gemma4E2B, .gemma4E4B:
+        case .gemma4E2B:
             guard let info = Self.modelInfo(for: kind) else { return false }
             return ModelDownloader.shared.localModelURL(for: info) != nil
+        case .gemma4E4B:
+            return Self.gemma4E4BLocalBundleReady()
         case .mistral7B:
             return Self.mistralResolveLocation() != nil
+        }
+    }
+
+    /// prefill chunk 포함 풀번들이 올라간 HF repo. mlboydaisuke repo와 달리 prefill chunks 포함.
+    nonisolated private static let gemma4E4BRepo = "someone15/gemma-4-E4B-coreml"
+
+    /// prefill chunk 포함 Gemma 4 E4B 풀번들 위치 (decode + prefill chunks + embeddings + sidecars + tokenizer).
+    /// 첫 실행 시 `downloadGemma4E4BBundle()`이 HF `someone15/gemma-4-E4B-coreml`에서 여기로 다운로드.
+    nonisolated private static func gemma4E4BLocalBundleURL() -> URL? {
+        guard let appSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false
+        ) else { return nil }
+        return appSupport
+            .appendingPathComponent("CPlanner", isDirectory: true)
+            .appendingPathComponent("gemma-4-e4b", isDirectory: true)
+    }
+
+    /// 자체 번들의 필수 파일 존재 여부 검증. chunks + prefill chunks + tokenizer + config + 핵심 sidecar.
+    nonisolated private static func gemma4E4BLocalBundleReady() -> Bool {
+        guard let dir = gemma4E4BLocalBundleURL() else { return false }
+        let fm = FileManager.default
+        let required: [String] = [
+            "chunk1.mlmodelc", "chunk2.mlmodelc", "chunk3.mlmodelc", "chunk4.mlmodelc",
+            "prefill_chunk1.mlmodelc", "prefill_chunk2.mlmodelc",
+            "prefill_chunk3.mlmodelc", "prefill_chunk4.mlmodelc",
+            "model_config.json", "hf_model/tokenizer.json",
+            "embed_tokens_q8.bin", "embed_tokens_scales.bin",
+            "cos_sliding.npy", "sin_sliding.npy"
+        ]
+        return required.allSatisfy {
+            fm.fileExists(atPath: dir.appendingPathComponent($0).path)
+        }
+    }
+
+    /// 진단용 — 어떤 파일이 누락됐는지 출력.
+    nonisolated private static func dumpMissingBundleFiles(at dir: URL) {
+        let fm = FileManager.default
+        let required: [String] = [
+            "chunk1.mlmodelc", "chunk2.mlmodelc", "chunk3.mlmodelc", "chunk4.mlmodelc",
+            "prefill_chunk1.mlmodelc", "prefill_chunk2.mlmodelc",
+            "prefill_chunk3.mlmodelc", "prefill_chunk4.mlmodelc",
+            "model_config.json", "hf_model/tokenizer.json",
+            "embed_tokens_q8.bin", "embed_tokens_scales.bin",
+            "cos_sliding.npy", "sin_sliding.npy"
+        ]
+        for f in required {
+            let p = dir.appendingPathComponent(f).path
+            let ok = fm.fileExists(atPath: p)
+            print("[ModelInstaller]   \(ok ? "✓" : "✗") \(f)  (\(p))")
         }
     }
 
@@ -157,6 +212,27 @@ final class ModelInstaller: ObservableObject {
     }
 
     private func loadGemmaBackend(kind: ModelKind) async {
+        // E4B는 prefill chunk 포함 풀번들을 HF에서 받아 local path로 직접 load.
+        // 라이브러리 download path는 prefill이 없어 17× 느리므로 사용하지 않는다.
+        if kind == .gemma4E4B {
+            if !Self.gemma4E4BLocalBundleReady() {
+                logger.info("E4B 번들 미설치 — HF \(Self.gemma4E4BRepo, privacy: .public)에서 다운로드.")
+                do {
+                    try await downloadGemma4E4BBundle()
+                } catch {
+                    logger.error("E4B 번들 다운로드 실패: \(error.localizedDescription, privacy: .public)")
+                    state = .failed(message: "Gemma 4 E4B 다운로드 실패: \(error.localizedDescription)")
+                    return
+                }
+            }
+            guard let bundleURL = Self.gemma4E4BLocalBundleURL(), Self.gemma4E4BLocalBundleReady() else {
+                if let url = Self.gemma4E4BLocalBundleURL() { Self.dumpMissingBundleFiles(at: url) }
+                state = .failed(message: "Gemma 4 E4B 번들 검증 실패 — 일부 파일 누락.")
+                return
+            }
+            await loadGemmaFromLocalBundle(kind: kind, directory: bundleURL)
+            return
+        }
         guard let info = Self.modelInfo(for: kind) else {
             logger.error("\(kind.displayName, privacy: .public) ModelInfo 매핑 누락.")
             state = .failed(message: "\(kind.displayName) 매핑이 없습니다.")
@@ -178,6 +254,65 @@ final class ModelInstaller: ObservableObject {
             logger.error("Load failed: \(error.localizedDescription, privacy: .public)")
             state = .failed(message: "모델 로드 실패: \(error.localizedDescription)")
         }
+    }
+
+    /// 자체 변환 Gemma 4 E4B 번들을 라이브러리의 `CoreMLLLM.load(from:)`으로 직접 load.
+    /// 라이브러리는 디렉터리에 chunk1.mlmodelc가 있으면 chunked SWA 경로로 자동 분기.
+    private func loadGemmaFromLocalBundle(kind: ModelKind, directory: URL) async {
+        logger.info("loadGemmaFromLocalBundle dir=\(directory.path, privacy: .public)")
+        state = .compiling
+        let units = computeUnits
+        let cb = Self.makeProgressCallback()
+        cb("Gemma 4 E4B 로컬 번들 로드 중…")
+        do {
+            let llm = try await CoreMLLLM.load(
+                from: directory,
+                computeUnits: units,
+                onProgress: cb
+            )
+            logger.info("\(kind.displayName, privacy: .public) (local) loaded. ctx=\(llm.contextLength, privacy: .public)")
+            let backend = GemmaBackend(kind: kind, llm: llm)
+            await LocalLLMService.shared.attachBackend(backend, computeUnits: units)
+            state = .ready
+        } catch {
+            logger.error("Local bundle load failed: \(error.localizedDescription, privacy: .public)")
+            state = .failed(message: "로컬 E4B 번들 로드 실패: \(error.localizedDescription)")
+        }
+    }
+
+    /// HF `someone15/gemma-4-E4B-coreml`에서 prefill chunk 포함 풀번들을 받아 local bundle 경로로 배치.
+    /// `matching: []` → repo 전체 파일 다운로드 (HubApi.getFilenames: 빈 globs면 전 파일 반환).
+    /// `<hubBase>/models/<repo>/`에 받은 뒤 번들 경로로 moveItem.
+    private func downloadGemma4E4BBundle() async throws {
+        guard let bundleURL = Self.gemma4E4BLocalBundleURL() else {
+            throw NSError(domain: "ModelInstaller", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "E4B 번들 경로를 만들 수 없습니다."])
+        }
+        state = .downloading(progress: 0.0, statusText: "Gemma 4 E4B 다운로드 준비 중…")
+
+        let parent = bundleURL.deletingLastPathComponent()  // <App Support>/CPlanner/
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let hubBase = parent.appendingPathComponent("hub-e4b", isDirectory: true)
+        try? FileManager.default.removeItem(at: hubBase)
+        try FileManager.default.createDirectory(at: hubBase, withIntermediateDirectories: true)
+
+        let api = HubApi(downloadBase: hubBase)
+        let repo = Hub.Repo(id: Self.gemma4E4BRepo)
+        let snapshotURL = try await api.snapshot(from: repo, matching: []) { @Sendable progress in
+            let frac = progress.fractionCompleted
+            let stat = "Gemma 4 E4B 다운로드 중 — \(Int(frac * 100))%"
+            Task { @MainActor in
+                ModelInstaller.shared.state = .downloading(progress: frac, statusText: stat)
+            }
+        }
+
+        // 받은 스냅샷(repo 루트 = 번들 구조)을 번들 경로로 이동.
+        if FileManager.default.fileExists(atPath: bundleURL.path) {
+            try FileManager.default.removeItem(at: bundleURL)
+        }
+        try FileManager.default.moveItem(at: snapshotURL, to: bundleURL)
+        try? FileManager.default.removeItem(at: hubBase)
+        logger.info("E4B bundle downloaded → \(bundleURL.path, privacy: .public)")
     }
 
     /// 라이브러리에 넘길 progress callback. 캡처를 최소화해 Sendable 제약을 만족.
