@@ -181,16 +181,20 @@ actor GemmaBackend: LLMBackend {
 
         do {
             llm.reset()  // 이전 턴의 KV cache 오염 방지
-            let output = try await llm.generate(messages, maxTokens: 1)
-            let clean = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                              .trimmingCharacters(in: .punctuationCharacters)
-                              .uppercased()
-            if clean.count == 1, let index = labels.firstIndex(of: clean) {
+            // E4B는 letter 앞에 '(' / 따옴표 / 공백 같은 토큰을 흘릴 때가 있다(2026-05-27 관측: raw='(').
+            // 1-token + "정확히 한 글자" 강제로는 그 토큰 하나에 전량 '일반' fallback 되므로,
+            // 토큰을 약간 더 받아 출력에서 첫 유효 라벨 letter를 스캔해 복구한다. 모델은 보통 letter
+            // 직후 <end_of_turn>로 멈추므로 평상시 추가 디코드 비용은 거의 없다.
+            let output = try await llm.generate(messages, maxTokens: 6)
+            let upper = output.uppercased()
+            if let matched = upper.first(where: { labels.contains(String($0)) }) {
+                let letter = String(matched)
+                let index = labels.firstIndex(of: letter)!
                 let result = usableFolders[index]
-                llmLogger.info("[\(self.kind.displayName, privacy: .public)] 분류 성공: \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(clean, privacy: .public))")
+                llmLogger.info("[\(self.kind.displayName, privacy: .public)] 분류 성공: \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(letter, privacy: .public))")
                 return (result, 1.0)
             }
-            llmLogger.info("[\(self.kind.displayName, privacy: .public)] 매치 안 됨 — '일반'으로 fallback. raw='\(output, privacy: .public)' clean='\(clean, privacy: .public)'")
+            llmLogger.info("[\(self.kind.displayName, privacy: .public)] 매치 안 됨 — '일반'으로 fallback. task='\(sanitizedTitle, privacy: .public)' raw='\(output, privacy: .public)'")
             return ("일반", 0.0)
         } catch {
             llmLogger.error("[\(self.kind.displayName, privacy: .public)] inference 에러: \(error.localizedDescription, privacy: .public)")
@@ -377,7 +381,7 @@ actor MistralBackend: LLMBackend {
             llmLogger.error("[Mistral 7B] 추론 에러: \(error.localizedDescription, privacy: .public)")
         }
 
-        llmLogger.warning("[Mistral 7B] 분류 실패, '일반' 반환")
+        llmLogger.warning("[Mistral 7B] 분류 실패, '일반' 반환: task='\(sanitizedTitle, privacy: .public)'")
         return ("일반", 0.0)
     }
 
