@@ -25,6 +25,35 @@ import CoreMLLLM
 import Tokenizers
 import os
 
+/// `downloadGemma4E4BBundle`의 정체 감지용. progress 콜백(@Sendable, 라이브러리 background thread)과
+/// watchdog(MainActor)이 공유하므로 `NSLock`으로 보호한다. 빌드 설정이
+/// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`라 기본 MainActor 추론을 막기 위해 `nonisolated` 명시.
+nonisolated private final class StallTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastAdvance = Date()
+    private var lastFraction = -1.0
+
+    /// progress가 실제로 증가했을 때만 타임스탬프 갱신 (같은 값 반복 콜백은 정체로 간주).
+    func record(_ fraction: Double) {
+        lock.lock(); defer { lock.unlock() }
+        if fraction > lastFraction {
+            lastFraction = fraction
+            lastAdvance = Date()
+        }
+    }
+
+    var secondsSinceAdvance: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(lastAdvance)
+    }
+
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        lastAdvance = Date()
+        lastFraction = -1.0
+    }
+}
+
 @MainActor
 final class ModelInstaller: ObservableObject {
     static let shared = ModelInstaller()
@@ -49,6 +78,9 @@ final class ModelInstaller: ObservableObject {
 
     /// 사용자 설정의 compute units. 모델별 default가 다름 (Gemma=ANE, Mistral=CPU+GPU).
     private(set) var computeUnits: MLComputeUnits = .cpuAndNeuralEngine
+
+    /// E4B 다운로드 watchdog가 "정체로 cancel했음"을 catch 블록에 알리는 플래그 (snapshot 재시도 판정용).
+    private var e4bDownloadStalled = false
 
     private init() {}
 
@@ -298,13 +330,9 @@ final class ModelInstaller: ObservableObject {
 
         let api = HubApi(downloadBase: hubBase)
         let repo = Hub.Repo(id: Self.gemma4E4BRepo)
-        let snapshotURL = try await api.snapshot(from: repo, matching: []) { @Sendable progress in
-            let frac = progress.fractionCompleted
-            let stat = "Gemma 4 E4B 다운로드 중 — \(Int(frac * 100))%"
-            Task { @MainActor in
-                ModelInstaller.shared.state = .downloading(progress: frac, statusText: stat)
-            }
-        }
+        // 정체(progress 무진척) 시 cancel+재시도로 감싼다. 이미 받은 파일은 라이브러리가
+        // commit-hash로 skip하므로 재시도는 파일 단위 resume(전체 재다운로드 아님).
+        let snapshotURL = try await snapshotWithStallWatchdog(api: api, repo: repo)
 
         // 받은 스냅샷(repo 루트 = 번들 구조)을 번들 경로로 이동.
         if FileManager.default.fileExists(atPath: bundleURL.path) {
@@ -313,6 +341,65 @@ final class ModelInstaller: ObservableObject {
         try FileManager.default.moveItem(at: snapshotURL, to: bundleURL)
         try? FileManager.default.removeItem(at: hubBase)
         logger.info("E4B bundle downloaded → \(bundleURL.path, privacy: .public)")
+    }
+
+    /// `api.snapshot`을 정체 감지 watchdog로 감싼다. progress가 `stallTimeout`초간 무진척이면
+    /// snapshot Task를 cancel하고 재시도(최대 `maxAttempts`). 라이브러리는 이미 받은 파일을
+    /// commit-hash로 skip하므로 재시도는 파일 단위 resume(전체 재다운로드 아님). 진짜 에러
+    /// (네트워크 down/404 등)는 정체가 아니므로 즉시 throw.
+    /// 배경: 2026-05-27 첫 실행 다운로드가 decode chunk 직후 `nw_connection cancelled`로 ~5분
+    /// 정체 후 자력 회복한 사례 — 라이브러리 내부 재시도가 느려서 watchdog로 회복을 앞당긴다.
+    private func snapshotWithStallWatchdog(api: HubApi, repo: Hub.Repo) async throws -> URL {
+        let maxAttempts = 4
+        let stallTimeout: TimeInterval = 60
+        let tracker = StallTracker()
+        var lastError: Error?
+
+        for attempt in 1...maxAttempts {
+            tracker.reset()
+            e4bDownloadStalled = false
+
+            let snapshotTask = Task { () throws -> URL in
+                try await api.snapshot(from: repo, matching: []) { @Sendable progress in
+                    let frac = progress.fractionCompleted
+                    tracker.record(frac)
+                    let stat = "Gemma 4 E4B 다운로드 중 — \(Int(frac * 100))%"
+                    Task { @MainActor in
+                        ModelInstaller.shared.state = .downloading(progress: frac, statusText: stat)
+                    }
+                }
+            }
+
+            // watchdog: 10s마다 진척 확인, stallTimeout 초과 무진척이면 snapshot cancel.
+            let watchdog = Task { @MainActor in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 10 * 1_000_000_000)
+                    if Task.isCancelled { break }
+                    if tracker.secondsSinceAdvance > stallTimeout {
+                        self.e4bDownloadStalled = true
+                        snapshotTask.cancel()
+                        break
+                    }
+                }
+            }
+
+            do {
+                let url = try await snapshotTask.value
+                watchdog.cancel()
+                return url
+            } catch {
+                watchdog.cancel()
+                if e4bDownloadStalled && attempt < maxAttempts {
+                    lastError = error
+                    logger.warning("E4B 다운로드 \(Int(stallTimeout), privacy: .public)s 무진척 — 정체로 판단, 재시도 \(attempt + 1, privacy: .public)/\(maxAttempts, privacy: .public). 받은 파일은 skip하고 이어받음.")
+                    state = .downloading(progress: 0.0, statusText: "다운로드 정체 — 재연결 중… (\(attempt + 1)/\(maxAttempts))")
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastError ?? NSError(domain: "ModelInstaller", code: -2,
+                                   userInfo: [NSLocalizedDescriptionKey: "E4B 다운로드 재시도 소진"])
     }
 
     /// 라이브러리에 넘길 progress callback. 캡처를 최소화해 Sendable 제약을 만족.
