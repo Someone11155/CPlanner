@@ -468,6 +468,15 @@ actor LocalLLMService {
         return await backend.classify(taskTitle: taskTitle, availableFolders: availableFolders, corrections: corrections)
     }
 
+    /// 감시 폴더에 들어온 파일명을 분류기 입력 제목으로 변환: 확장자 제거 + 구분자(_,-) → 공백.
+    /// handleNewFileDetected와 파일-매칭 벤치마크가 같은 경로를 타도록 공용화 (재구현 금지).
+    nonisolated static func fileNameToClassifierTitle(_ fileName: String) -> String {
+        (fileName as NSString).deletingPathExtension
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// 분류 대상으로 삼을 만한 파일인지 (cheap pre-filter). 설치본/영상/압축본은 작업 산출물이
     /// 아니므로 분류 전에 제외. 카테고리 일치 판정은 호출부(handleNewFileDetected)에서 classifyTask로.
     nonisolated func isAcceptableFileType(_ fileName: String) -> Bool {

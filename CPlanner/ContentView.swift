@@ -275,12 +275,9 @@ class TaskManager: ObservableObject {
             guard LocalLLMService.shared.isAcceptableFileType(fileName) else { return }
 
             // 파일명이 이 감시 폴더와 "같은 카테고리"로 분류될 때만 완료 처리.
-            // 파일명을 분류기 입력 형태로 정규화: 확장자 제거 + 구분자(_,-) → 공백.
-            // 전체 폴더 목록에 대해 분류 → 결과가 rule.folderName일 때만 (= 다른 폴더보다 이 폴더에 가까움).
-            let title = newest.deletingPathExtension().lastPathComponent
-                .replacingOccurrences(of: "_", with: " ")
-                .replacingOccurrences(of: "-", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // 파일명을 분류기 입력 형태로 정규화 후, 전체 폴더에 대해 분류 →
+            // 결과가 rule.folderName일 때만 (= 다른 폴더보다 이 폴더에 가까움).
+            let title = LocalLLMService.fileNameToClassifierTitle(fileName)
             let folderNames = self.folderRules.map { $0.folderName }
             let activeCorrections = Array(self.corrections.filter { folderNames.contains($0.folderName) }.suffix(5))
             let (matched, _) = await LocalLLMService.shared.classifyTask(
@@ -1251,6 +1248,7 @@ struct SettingsView: View {
     @State private var addRuleError: String? = nil
     @State private var benchmarkRunning = false
     @State private var benchmarkProgress = 0
+    @State private var benchmarkTotal = 0
     @State private var benchmarkResult: String? = nil
     @State private var benchmarkTask: Task<Void, Never>? = nil
     // 세션 한정 — UserDefaults persistence 제거됨. 앱 재시작 시 .cpuAndNeuralEngine로 시작.
@@ -1415,27 +1413,34 @@ struct SettingsView: View {
                         .foregroundColor(.tdmIconRepeatTomorrow)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    HStack {
-                        Button(action: {
-                            if benchmarkRunning { benchmarkTask?.cancel() }
-                            else { runBenchmark() }
-                        }) {
-                            Text(benchmarkRunning ? "중단" : "벤치마크 실행 (\(Self.benchmarkIterations)회 랜덤)")
-                                .primaryPill()
-                        }
-                        .buttonStyle(.plain)
-                        Text("프리셋 \(Self.benchmarkPresets.count)개에서 \(Self.benchmarkIterations)개 랜덤 추출")
-                            .font(DesignFont.bodySmall())
-                            .foregroundColor(.tdmInkTertiary)
-                        Spacer()
-                    }
                     if benchmarkRunning {
                         HStack(spacing: DesignSpacing.xs) {
+                            Button(action: { benchmarkTask?.cancel() }) {
+                                Text("중단").primaryPill()
+                            }
+                            .buttonStyle(.plain)
                             ProgressView().controlSize(.small).tint(.tdmYellow)
-                            Text("진행 \(benchmarkProgress)/\(Self.benchmarkIterations)…")
+                            Text("진행 \(benchmarkProgress)/\(benchmarkTotal)…")
                                 .font(DesignFont.bodySmall())
                                 .foregroundColor(.tdmInkBio)
+                            Spacer()
                         }
+                    } else {
+                        HStack(spacing: DesignSpacing.sm) {
+                            Button(action: { runBenchmark() }) {
+                                Text("속도 벤치마크 (\(Self.benchmarkIterations)회)").primaryPill()
+                            }
+                            .buttonStyle(.plain)
+                            Button(action: { runMatchBenchmark() }) {
+                                Text("파일 매칭 정확도").secondaryPill()
+                            }
+                            .buttonStyle(.plain)
+                            Spacer()
+                        }
+                        Text("속도: 프리셋 \(Self.benchmarkPresets.count)개 중 \(Self.benchmarkIterations)개 랜덤 · 정확도: 내 corrections를 ground truth로 held-out 측정")
+                            .font(DesignFont.bodySmall())
+                            .foregroundColor(.tdmInkTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     if let result = benchmarkResult {
                         Text(result)
@@ -1508,6 +1513,7 @@ struct SettingsView: View {
 
         benchmarkRunning = true
         benchmarkProgress = 0
+        benchmarkTotal = Self.benchmarkIterations
         benchmarkResult = nil
 
         benchmarkTask = Task { @MainActor in
@@ -1538,6 +1544,63 @@ struct SettingsView: View {
                          units, total, Self.benchmarkIterations, avg, wall)
                 : String(format: "[%@] %d회 평균 추론 시간 %.2fs · 총 %.1fs",
                          units, total, avg, wall)
+            benchmarkRunning = false
+        }
+    }
+
+    /// 파일 매칭 정확도 벤치마크 — 감시 폴더 자동완료가 의존하는 "파일명↔폴더 카테고리 일치"를 검증.
+    /// 사용자가 직접 분류한 `corrections`(title→folder)를 ground truth로 사용:
+    ///   각 항목의 title을 `제목 공백→_  + .pdf`로 합성해 실제 감지 경로와 동일한
+    ///   `LocalLLMService.fileNameToClassifierTitle`로 normalize → classifyTask → 결과가 원래 폴더인지.
+    /// **held-out**: 평가 항목 자신은 few-shot 컨텍스트에서 제외(정확매치 단축/암기 누수 차단)해
+    /// 모델의 일반화 분류력을 잰다. 정확도가 낮으면 그 폴더 조합에선 파일 자동완료 오작동 가능성이 큼.
+    private func runMatchBenchmark() {
+        let folders = taskManager.folderRules.map { $0.folderName }
+        guard folders.count >= 2 else { return }
+        let labeled = taskManager.corrections.filter { folders.contains($0.folderName) }
+        // 최근 30개로 cap — corrections가 많아도 측정 시간 폭주 방지.
+        let samples = Array(labeled.suffix(30))
+        guard samples.count >= 2 else {
+            benchmarkResult = "정확도 측정 불가 — 폴더 분류를 직접 몇 번 수정(corrections)하면 그걸 ground truth로 측정해요. (현재 \(samples.count)개)"
+            return
+        }
+
+        benchmarkRunning = true
+        benchmarkProgress = 0
+        benchmarkTotal = samples.count
+        benchmarkResult = nil
+
+        benchmarkTask = Task { @MainActor in
+            var correct = 0
+            var total = 0
+            var misses: [String] = []
+            let startWall = Date()
+            for c in samples {
+                if Task.isCancelled { break }
+                // 드롭된 파일처럼 합성 후, 실제 감지 경로와 동일한 normalize를 통과시킨다.
+                let fakeFile = c.taskTitle.replacingOccurrences(of: " ", with: "_") + ".pdf"
+                let title = LocalLLMService.fileNameToClassifierTitle(fakeFile)
+                let context = Array(labeled.filter { $0.taskTitle != c.taskTitle }.suffix(5))
+                let (matched, _) = await LocalLLMService.shared.classifyTask(
+                    taskTitle: title,
+                    availableFolders: folders,
+                    corrections: context
+                )
+                total += 1
+                if matched == c.folderName {
+                    correct += 1
+                } else if misses.count < 5 {
+                    misses.append("\(c.taskTitle)→\(matched)≠\(c.folderName)")
+                }
+                benchmarkProgress = total
+            }
+            let cancelled = Task.isCancelled
+            let wall = Date().timeIntervalSince(startWall)
+            let pct = total > 0 ? Double(correct) / Double(total) * 100 : 0
+            let head = cancelled ? "중단됨 · " : ""
+            let missStr = misses.isEmpty ? "" : " · 오분류: " + misses.joined(separator: ", ")
+            benchmarkResult = String(format: "%@파일 매칭 정확도(held-out) %d/%d (%.0f%%) · %.1fs%@",
+                                     head, correct, total, pct, wall, missStr)
             benchmarkRunning = false
         }
     }
