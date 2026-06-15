@@ -139,19 +139,21 @@ final class ModelInstaller: ObservableObject {
             .appendingPathComponent("gemma-4-e4b", isDirectory: true)
     }
 
-    /// 자체 번들의 필수 파일 존재 여부 검증. chunks + prefill chunks + tokenizer + config + 핵심 sidecar.
+    /// 풀번들 무결성 검증에 필요한 핵심 파일들. chunks + prefill chunks + tokenizer + config + 핵심 sidecar.
+    nonisolated private static let gemma4E4BRequiredFiles: [String] = [
+        "chunk1.mlmodelc", "chunk2.mlmodelc", "chunk3.mlmodelc", "chunk4.mlmodelc",
+        "prefill_chunk1.mlmodelc", "prefill_chunk2.mlmodelc",
+        "prefill_chunk3.mlmodelc", "prefill_chunk4.mlmodelc",
+        "model_config.json", "hf_model/tokenizer.json",
+        "embed_tokens_q8.bin", "embed_tokens_scales.bin",
+        "cos_sliding.npy", "sin_sliding.npy"
+    ]
+
+    /// 자체 번들의 필수 파일 존재 여부 검증.
     nonisolated private static func gemma4E4BLocalBundleReady() -> Bool {
         guard let dir = gemma4E4BLocalBundleURL() else { return false }
         let fm = FileManager.default
-        let required: [String] = [
-            "chunk1.mlmodelc", "chunk2.mlmodelc", "chunk3.mlmodelc", "chunk4.mlmodelc",
-            "prefill_chunk1.mlmodelc", "prefill_chunk2.mlmodelc",
-            "prefill_chunk3.mlmodelc", "prefill_chunk4.mlmodelc",
-            "model_config.json", "hf_model/tokenizer.json",
-            "embed_tokens_q8.bin", "embed_tokens_scales.bin",
-            "cos_sliding.npy", "sin_sliding.npy"
-        ]
-        return required.allSatisfy {
+        return gemma4E4BRequiredFiles.allSatisfy {
             fm.fileExists(atPath: dir.appendingPathComponent($0).path)
         }
     }
@@ -159,15 +161,7 @@ final class ModelInstaller: ObservableObject {
     /// 진단용 — 어떤 파일이 누락됐는지 출력.
     nonisolated private static func dumpMissingBundleFiles(at dir: URL) {
         let fm = FileManager.default
-        let required: [String] = [
-            "chunk1.mlmodelc", "chunk2.mlmodelc", "chunk3.mlmodelc", "chunk4.mlmodelc",
-            "prefill_chunk1.mlmodelc", "prefill_chunk2.mlmodelc",
-            "prefill_chunk3.mlmodelc", "prefill_chunk4.mlmodelc",
-            "model_config.json", "hf_model/tokenizer.json",
-            "embed_tokens_q8.bin", "embed_tokens_scales.bin",
-            "cos_sliding.npy", "sin_sliding.npy"
-        ]
-        for f in required {
+        for f in gemma4E4BRequiredFiles {
             let p = dir.appendingPathComponent(f).path
             let ok = fm.fileExists(atPath: p)
             print("[ModelInstaller]   \(ok ? "✓" : "✗") \(f)  (\(p))")

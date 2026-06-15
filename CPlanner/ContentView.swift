@@ -270,10 +270,25 @@ class TaskManager: ObservableObject {
                 let bDate = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 return aDate < bDate
             }
-            guard let fileName = newest?.lastPathComponent else { return }
+            guard let newest else { return }
+            let fileName = newest.lastPathComponent
+            guard LocalLLMService.shared.isAcceptableFileType(fileName) else { return }
 
-            let isValid = LocalLLMService.shared.validateFileContext(fileName: fileName, folderName: rule.folderName)
-            guard isValid else { return }
+            // 파일명이 이 감시 폴더와 "같은 카테고리"로 분류될 때만 완료 처리.
+            // 파일명을 분류기 입력 형태로 정규화: 확장자 제거 + 구분자(_,-) → 공백.
+            // 전체 폴더 목록에 대해 분류 → 결과가 rule.folderName일 때만 (= 다른 폴더보다 이 폴더에 가까움).
+            let title = newest.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "_", with: " ")
+                .replacingOccurrences(of: "-", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let folderNames = self.folderRules.map { $0.folderName }
+            let activeCorrections = Array(self.corrections.filter { folderNames.contains($0.folderName) }.suffix(5))
+            let (matched, _) = await LocalLLMService.shared.classifyTask(
+                taskTitle: title, availableFolders: folderNames, corrections: activeCorrections)
+            guard matched == rule.folderName else {
+                taskManagerLogger.info("파일 '\(fileName, privacy: .public)' → '\(matched, privacy: .public)' (감시 폴더 '\(rule.folderName, privacy: .public)'와 카테고리 불일치) — 완료 스킵")
+                return
+            }
 
             if let idx = self.tasks.firstIndex(where: { $0.targetFolder == rule.folderName && !$0.isCompleted }) {
                 self.tasks[idx].isCompleted = true
@@ -629,7 +644,6 @@ struct CustomCalendarView: View {
             removal:   .move(edge: outEdge).combined(with: .opacity)
         )
     }
-    func hasTasks(date: Date) -> Bool { taskManager.tasks.contains { calendar.isDate($0.date, inSameDayAs: date) } }
     func taskCount(for date: Date) -> Int { taskManager.tasks.lazy.filter { calendar.isDate($0.date, inSameDayAs: date) }.count }
     func completedCount(for date: Date) -> Int {
         taskManager.tasks.lazy.filter { calendar.isDate($0.date, inSameDayAs: date) && $0.isCompleted }.count
@@ -823,10 +837,10 @@ struct ContentView: View {
                 .font(DesignFont.bodyMedium())
                 .lineLimit(1)
             Spacer()
-            // 신뢰도 < 100%일 때만 % 표시 — Gemma binary(1.0) / 정확매치 메모(1.0)는 안 붙임.
-            // Mistral softmax 결과는 보통 100% 미만이라 자연스럽게 노출됨.
+            // 0 < 신뢰도 < 100%일 때만 % 표시. 1.0(Gemma 성공/정확매치 메모)도, 0.0(두 모델의
+            // 하드 실패 → "일반" fallback)도 % 안 붙임. Mistral softmax는 그 사이라 자연 노출됨.
             Text(task.classificationConfidence
-                .flatMap { c in c < 1.0 ? "\(task.targetFolder) (\(Int(c * 100))%)" : nil }
+                .flatMap { c in (0.0 < c && c < 1.0) ? "\(task.targetFolder) (\(Int(c * 100))%)" : nil }
                 ?? task.targetFolder)
                 .font(DesignFont.bodySmall())
                 .foregroundColor(.tdmInkBio)

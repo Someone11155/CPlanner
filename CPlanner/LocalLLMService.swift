@@ -468,7 +468,9 @@ actor LocalLLMService {
         return await backend.classify(taskTitle: taskTitle, availableFolders: availableFolders, corrections: corrections)
     }
 
-    nonisolated func validateFileContext(fileName: String, folderName: String) -> Bool {
+    /// 분류 대상으로 삼을 만한 파일인지 (cheap pre-filter). 설치본/영상/압축본은 작업 산출물이
+    /// 아니므로 분류 전에 제외. 카테고리 일치 판정은 호출부(handleNewFileDetected)에서 classifyTask로.
+    nonisolated func isAcceptableFileType(_ fileName: String) -> Bool {
         let lower = fileName.lowercased()
         let junk = [".dmg", ".exe", ".mp4", ".zip"]
         return !junk.contains(where: { lower.hasSuffix($0) }) && lower.count >= 2
