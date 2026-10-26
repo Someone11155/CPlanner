@@ -55,7 +55,7 @@ struct ModelSettingsTab: View {
             } header: {
                 Text("현재 모델")
             } footer: {
-                Text("선택한 모델은 다음 분류부터 적용됩니다. 모델 변경 시 새 모델이 다운로드되지 않았다면 다운로드(3.8~5.5GB)와 ANE 컴파일(1~2분)이 필요해요. 이전 모델 캐시는 디스크에 그대로 남습니다.")
+                Text("선택한 모델은 다음 분류부터 적용됩니다. 모델이 다운로드되지 않았다면 다운로드(약 7.7GB)와 ANE 컴파일(1~2분)이 필요해요. 이전 모델 캐시는 디스크에 그대로 남습니다.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -133,34 +133,10 @@ struct GeneralSettingsTab: View {
 // MARK: - 분류 (Classification)
 
 struct ClassificationSettingsTab: View {
-    @AppStorage("cplanner.app.classification.confidenceThreshold") private var confidenceThreshold: Double = 0.75
     @AppStorage("cplanner.app.classification.exactMatchShortcut") private var exactMatchShortcut: Bool = true
 
     var body: some View {
         Form {
-            Section {
-                HStack {
-                    Text("신뢰도 임계값")
-                    Slider(value: $confidenceThreshold, in: 0.5...0.95, step: 0.05) {
-                        Text("신뢰도 임계값")
-                    } minimumValueLabel: {
-                        Text("50%").font(.caption2).foregroundColor(.secondary)
-                    } maximumValueLabel: {
-                        Text("95%").font(.caption2).foregroundColor(.secondary)
-                    }
-                    Text("\(Int(confidenceThreshold * 100))%")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(width: 40, alignment: .trailing)
-                }
-            } header: {
-                Text("자동 분류")
-            } footer: {
-                Text("Gemma 4 E2B로 전환된 후 분류 신뢰도가 이진(binary)으로 단순화됐어요 — 깨끗한 단일 알파벳 매치는 100%, 그 외는 '일반'(0%). 이 슬라이더는 향후 logit-level 신뢰도 복원 시 재활성화 예정.")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-
             Section {
                 Toggle("같은 제목 분류 이력 즉시 재사용 (정확매치 단축)", isOn: $exactMatchShortcut)
             } header: {
@@ -173,6 +149,19 @@ struct ClassificationSettingsTab: View {
         }
         .formStyle(.grouped)
         .padding()
+    }
+}
+
+/// 분류 신뢰도 임계값 — 사용자에게는 숨김(설정 UI 비노출). 옵션 값/UserDefaults 키는 유지해
+/// 코드/저장소로만 조정 가능. 현재 Gemma는 binary(1.0/0.0)라 평시 미사용이며, 향후 logit-level
+/// 신뢰도 복원 시 `ClassificationSettingsTab`에 슬라이더를 다시 노출하면 된다.
+enum ClassificationOptions {
+    static let confidenceThresholdKey = "cplanner.app.classification.confidenceThreshold"
+    static let defaultConfidenceThreshold: Double = 0.75
+
+    static var confidenceThreshold: Double {
+        get { (UserDefaults.standard.object(forKey: confidenceThresholdKey) as? Double) ?? defaultConfidenceThreshold }
+        set { UserDefaults.standard.set(newValue, forKey: confidenceThresholdKey) }
     }
 }
 

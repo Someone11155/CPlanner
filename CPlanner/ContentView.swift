@@ -680,16 +680,7 @@ struct TipBar: View {
         "달력의 작은 점은 그날 할 일이 있다는 뜻이에요",
         "할 일을 우클릭하면 삭제할 수 있어요"
     ]
-    /// Mistral 선택 시에만 노출되는 신뢰도 관련 팁. Gemma는 binary(1.0/0.0)라 % / threshold 개념 없음.
-    static let mistralOnlyTips: [String] = [
-        "폴더 옆 % 숫자는 AI의 자신감 — 낮으면 직접 확인해보세요",
-        "신뢰도 75% 미만이면 자동으로 '일반' 폴더로 분류돼요"
-    ]
-
     static func activeTips() -> [String] {
-        if ModelSelection.current == .mistral7B {
-            return commonTips + mistralOnlyTips
-        }
         return commonTips
     }
 
@@ -834,8 +825,9 @@ struct ContentView: View {
                 .font(DesignFont.bodyMedium())
                 .lineLimit(1)
             Spacer()
-            // 0 < 신뢰도 < 100%일 때만 % 표시. 1.0(Gemma 성공/정확매치 메모)도, 0.0(두 모델의
-            // 하드 실패 → "일반" fallback)도 % 안 붙임. Mistral softmax는 그 사이라 자연 노출됨.
+            // 0 < 신뢰도 < 100%일 때만 % 표시. 1.0(Gemma 성공/정확매치 메모)도, 0.0(하드 실패 →
+            // "일반" fallback)도 % 안 붙임. Gemma는 binary(1.0/0.0)라 평시엔 % 미노출 — 분수 신뢰도
+            // 모델 추가 시 자연 노출되도록 분기는 유지.
             Text(task.classificationConfidence
                 .flatMap { c in (0.0 < c && c < 1.0) ? "\(task.targetFolder) (\(Int(c * 100))%)" : nil }
                 ?? task.targetFolder)
@@ -1403,7 +1395,7 @@ struct SettingsView: View {
                 Text("바꾸면 모델 재로드 필요 — 첫 분류 전 잠시 대기")
                     .font(DesignFont.bodySmall())
                     .foregroundColor(.tdmInkTertiary)
-                Text("Gemma 4 E2B는 ANE 친화적 — `.cpuAndNeuralEngine` 모드가 가장 효율적 (~91% ANE residency)")
+                Text("Gemma 4 E4B는 ANE 친화적 — `.cpuAndNeuralEngine` 모드가 가장 효율적 (~91% ANE residency)")
                     .font(DesignFont.bodySmall())
                     .foregroundColor(.tdmInkTertiary)
 

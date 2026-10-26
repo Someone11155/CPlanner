@@ -3,29 +3,23 @@
 //  Cplanner
 //
 //  분류 백엔드 추상화 — `LLMBackend` 프로토콜로 모델별 구현체를 swap 가능하게 함.
-//  Phase 1+2 (2026-05-11): Gemma 4 E2B / E4B 두 변종을 `GemmaBackend`로 통합 처리.
-//  Phase 3 (다음 세션): `MistralBackend` 추가 예정 — raw MLModel + MLState + softmax 신뢰도.
+//  현재는 Gemma 4 E4B 단독을 `GemmaBackend`로 처리 (Gemma 변종 공용 경로).
 //
 //  `LocalLLMService`는 백엔드 무관 coordinator —
 //    1) F1.2 정확매치 단축 (모델 무관, 캐시된 corrections 비교)
 //    2) 백엔드 위임 (현재 attached된 backend.classify로 라우팅)
-//  `ModelInstaller`가 사용자 선택(`ModelKind`)에 따라 `GemmaBackend` 또는 (Phase 3)
-//  `MistralBackend`를 만들어 `attachBackend(_:)`로 넘겨준다.
+//  `ModelInstaller`가 사용자 선택(`ModelKind`)에 따라 `GemmaBackend`를 만들어
+//  `attachBackend(_:)`로 넘겨준다.
 //
 //  Gemma confidence semantics: 라이브러리(`john-rocky/CoreML-LLM`)가 raw logits를 노출 안 함 →
 //  알파벳 token softmax 불가. binary로 단순화 — 깨끗한 단일 A-Z + 유효 폴더 매핑 = 1.0,
-//  그 외(빈/multi-char/알파벳 외/범위 밖) = "일반" + 0.0. Mistral 복원 시(Phase 3)에는
-//  softmax 0~1 + 75% threshold가 부활한다.
+//  그 외(빈/multi-char/알파벳 외/범위 밖) = "일반" + 0.0.
 //
 
 import Foundation
 import CoreML
 import CoreMLLLM
-import Tokenizers
 import os
-
-// MLModel은 ObjC class로 SDK가 아직 Sendable 표시를 안 함. MistralBackend actor 안에서만 접근하므로 안전.
-extension MLModel: @retroactive @unchecked Sendable {}
 
 nonisolated(unsafe) private let llmLogger = Logger(subsystem: "com.cplanner", category: "LocalLLMService")
 
@@ -38,57 +32,46 @@ nonisolated(unsafe) private let classificationLabelAlphabet: [String] =
 /// 사용자가 선택 가능한 LLM 모델 종류. `UserDefaults`에 `rawValue`로 영속화됨.
 /// 프로젝트가 Swift 6 default-isolation = MainActor라 actor 컨텍스트에서 접근 가능하도록 각 멤버 `nonisolated`.
 enum ModelKind: String, Codable, CaseIterable, Sendable {
-    case gemma4E2B = "gemma-4-e2b"
+    // 현재는 E4B 단독 운영. 다른 모델을 다시 쓰려면 여기에 case를 추가하면
+    // 모델 선택 UI(ModelPickerSheet / 설정 '모델' 탭)가 allCases 순회로 자동 복원된다.
     case gemma4E4B = "gemma-4-e4b"
-    case mistral7B = "mistral-7b"
 
     /// UI에 표시할 짧은 이름.
     nonisolated var displayName: String {
         switch self {
-        case .gemma4E2B: return "Gemma 4 E2B"
         case .gemma4E4B: return "Gemma 4 E4B"
-        case .mistral7B: return "Mistral 7B"
         }
     }
 
     /// 대략 다운로드 크기 (GB).
     nonisolated var sizeGB: Double {
         switch self {
-        case .gemma4E2B: return 5.4
         case .gemma4E4B: return 7.7
-        case .mistral7B: return 3.8
         }
     }
 
     /// 사용자에게 보일 짧은 특징 설명.
     nonisolated var summary: String {
         switch self {
-        case .gemma4E2B: return "빠름 · ANE 최적화 · 5.4GB"
         case .gemma4E4B: return "더 정확 · prefill 가속 · 7.7GB"
-        case .mistral7B: return "신뢰도 % 표시 · 다소 느림 · 3.8GB"
         }
     }
 
     /// 좀 더 자세한 설명 — picker 카드용.
     nonisolated var detail: String {
         switch self {
-        case .gemma4E2B:
-            return "35 layers, hidden=2048. 분류 1건 ~730ms. ANE 친화적, 가벼움. 신뢰도는 binary (1.0 / 0.0)."
         case .gemma4E4B:
             return "42 layers, hidden=2560. 분류 ~1~2s 예상. 더 큰 컨텍스트 이해, 어려운 입력에 더 강함. 신뢰도는 binary."
-        case .mistral7B:
-            return "원조 모델. 분류 1건 ~8.8s, ANE 모드 hang 가능 → CPU+GPU 권장. softmax 신뢰도(0~100%) 노출."
         }
     }
 
-    /// 사용 가능한 모델. Phase 3 (2026-05-12)에서 Mistral도 활성화.
+    /// 사용 가능한 모델. 현재 모든 모델 사용 가능 — 향후 모델 추가 시 게이트로 재사용.
     nonisolated var isAvailable: Bool { true }
 
     /// 각 모델에 권장되는 기본 compute units.
     nonisolated var defaultComputeUnits: MLComputeUnits {
         switch self {
-        case .gemma4E2B, .gemma4E4B: return .cpuAndNeuralEngine
-        case .mistral7B: return .cpuAndGPU  // Mistral은 ANE 모드에서 hang했었음
+        case .gemma4E4B: return .cpuAndNeuralEngine
         }
     }
 }
@@ -123,17 +106,17 @@ protocol LLMBackend: AnyObject, Sendable {
     func classify(taskTitle: String, availableFolders: [String], corrections: [Correction]) async -> (folder: String, confidence: Double)
 }
 
-// MARK: - Gemma backend (E2B + E4B)
+// MARK: - Gemma backend
 
-/// Gemma 4 (E2B / E4B 공용). 라이브러리 `CoreMLLLM.generate(messages:maxTokens:1)`로 1-token greedy
-/// decode → A-Z letter 추출 → 폴더 매핑. 두 변종은 라이브러리 ModelInfo만 다르고 inference 경로는 동일.
+/// Gemma 4 (현재 E4B 단독, 향후 변종 공용). 라이브러리 `CoreMLLLM.generate(messages:maxTokens:1)`로
+/// 1-token greedy decode → A-Z letter 추출 → 폴더 매핑. 변종이 늘어도 inference 경로는 동일.
 @available(macOS 15.0, iOS 18.0, *)
 actor GemmaBackend: LLMBackend {
     nonisolated let kind: ModelKind
     private let llm: CoreMLLLM
 
     init(kind: ModelKind, llm: CoreMLLLM) {
-        precondition(kind == .gemma4E2B || kind == .gemma4E4B, "GemmaBackend requires Gemma kind")
+        precondition(kind == .gemma4E4B, "GemmaBackend requires Gemma kind")
         self.kind = kind
         self.llm = llm
     }
@@ -208,199 +191,6 @@ actor GemmaBackend: LLMBackend {
             .replacingOccurrences(of: "<end_of_turn>", with: "")
             .replacingOccurrences(of: "<bos>", with: "")
             .replacingOccurrences(of: "<eos>", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
-// MARK: - Mistral backend
-
-/// Mistral 7B Instruct v0.3 (apple/mistral-coreml int4 stateful 변종).
-/// 라이브러리(`john-rocky/CoreML-LLM`)가 Mistral 미지원이라 raw `MLModel` + `MLState` 직접 운용.
-///
-/// **Inference 경로:** prompt를 토큰 단위로 prefill (state 누적) → 마지막 토큰 위치의 logits 추출
-/// → 알파벳 letter token IDs(SentencePiece variants 포함)에 대해서만 logit 비교 → softmax로 신뢰도.
-///
-/// **신뢰도 semantics:** softmax over labels-only (vocab 32K 전체가 아님) — 사용자 입장에선
-/// "후보 폴더 N개 중 winner의 상대적 확신도". 75% threshold 미만이면 결과 폐기 + "일반"으로 fallback.
-///
-/// 옛 commit `8267940`의 `LocalLLMService.classifyTask` 220줄을 actor화. F1.2 정확매치 단축은
-/// `LocalLLMService` coordinator 쪽에서 처리하므로 여기선 logits 경로만 담당.
-@available(macOS 15.0, iOS 18.0, *)
-actor MistralBackend: LLMBackend {
-    nonisolated let kind: ModelKind = .mistral7B
-
-    private let tokenizer: Tokenizer
-    private let model: MLModel
-    /// SentencePiece 변형(`A`, ` A`, `▁A`, `\nA`)으로 인코딩한 letter→token ID 후보 맵.
-    /// classify에서 logits[id]만 비교하면 vocab 전체 sort 없이 argmax 가능.
-    private let alphabetTokenIDs: [String: [Int]]
-
-    /// 사용자 결정 (2026-05-04): softmax winner가 다른 폴더들보다 ~7-8배 확신 있을 때만 통과.
-    nonisolated private static let confidenceThreshold: Double = 0.75
-
-    init(tokenizer: Tokenizer, model: MLModel) {
-        self.tokenizer = tokenizer
-        self.model = model
-        var map: [String: [Int]] = [:]
-        for letter in classificationLabelAlphabet {
-            var ids = Set<Int>()
-            // SentencePiece는 위치/공백 prefix에 따라 다른 token ID. 후보 폭넓게.
-            let variants = [letter, " " + letter, "\n" + letter, "▁" + letter]
-            for v in variants {
-                let tokens = tokenizer.encode(text: v)
-                if tokens.count == 1 {
-                    ids.insert(tokens[0])
-                } else if tokens.count == 2 {
-                    // BOS + letter token 케이스
-                    ids.insert(tokens[1])
-                }
-            }
-            if !ids.isEmpty { map[letter] = Array(ids) }
-        }
-        self.alphabetTokenIDs = map
-        llmLogger.info("[Mistral 7B] 알파벳 토큰 맵 빌드: \(map.count, privacy: .public) letters covered")
-    }
-
-    func classify(taskTitle: String, availableFolders: [String], corrections: [Correction]) async -> (folder: String, confidence: Double) {
-        let usableFolders = Array(availableFolders.prefix(classificationLabelAlphabet.count))
-        if availableFolders.count > usableFolders.count {
-            llmLogger.warning("폴더가 26개를 초과 — 후행 폴더는 분류 불가능.")
-        }
-        let labels = Array(classificationLabelAlphabet.prefix(usableFolders.count))
-        guard !labels.isEmpty else { return ("일반", 0.0) }
-
-        let sanitizedTitle = sanitize(taskTitle)
-        var optionsText = ""
-        for (i, folder) in usableFolders.enumerated() {
-            optionsText += "\(labels[i]). \(folder)\n"
-        }
-
-        // 사용자 corrections few-shot
-        var fewShotExamples = ""
-        for c in corrections {
-            guard let folderIdx = usableFolders.firstIndex(of: c.folderName) else { continue }
-            let label = labels[folderIdx]
-            let safeTitle = sanitize(c.taskTitle)
-            fewShotExamples += "[INST] 카테고리:\n\(optionsText)할 일: \(safeTitle) [/INST] \(label) </s> "
-        }
-
-        // F1.3 — corrections가 있으면 cold-start seed 생략 (corrections가 format demonstration 충분).
-        // corrections == 0인 cold start만 시드 유지.
-        let staticSeed = corrections.isEmpty
-            ? "[INST] 분류 전문가로서 할 일을 카테고리 중 하나로 분류하세요. 대문자 알파벳 한 글자만 답하세요.\n카테고리:\nA. 운동\nB. 공부\n할 일: 헬스장 가기 [/INST] A </s> "
-            : ""
-
-        let prompt = """
-        \(staticSeed)\(fewShotExamples)[INST] 카테고리:
-        \(optionsText)
-        할 일: \(sanitizedTitle) [/INST]
-        """
-
-        let inputTokens = tokenizer.encode(text: prompt)
-
-        do {
-            let state = model.makeState()
-            var finalLogits: MLMultiArray?
-
-            for (i, tokenID) in inputTokens.enumerated() {
-                let inputIdsMA = try MLMultiArray(shape: [1, 1], dataType: .int32)
-                inputIdsMA[0] = NSNumber(value: Int32(tokenID))
-
-                // causalMask: fp16 [1, 1, 1, keyLen], 모든 위치 0 (마스크 없음)
-                let keyLen = i + 1
-                let maskMA = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: keyLen)], dataType: .float16)
-                let maskBytes = maskMA.dataPointer.bindMemory(to: UInt16.self, capacity: keyLen)
-                for j in 0..<keyLen { maskBytes[j] = 0 }
-
-                let inputs: [String: Any] = [
-                    "inputIds": inputIdsMA,
-                    "causalMask": maskMA
-                ]
-
-                let provider = try MLDictionaryFeatureProvider(dictionary: inputs)
-                let prediction = try await model.prediction(from: provider, using: state)
-
-                if i == inputTokens.count - 1 {
-                    finalLogits = prediction.featureValue(for: "logits")?.multiArrayValue
-                }
-            }
-
-            // F1.1 — Fast logits path: 알파벳 token IDs만 비교 → argmax + softmax.
-            if let logits = finalLogits, !alphabetTokenIDs.isEmpty {
-                let logitsCount = logits.count
-                var letterLogits: [Float] = []
-                letterLogits.reserveCapacity(labels.count)
-                for letter in labels {
-                    var best: Float = -.greatestFiniteMagnitude
-                    if let ids = alphabetTokenIDs[letter] {
-                        for id in ids where id < logitsCount {
-                            let s = logits[id].floatValue
-                            if s > best { best = s }
-                        }
-                    }
-                    letterLogits.append(best)
-                }
-                if let bestScore = letterLogits.max(), bestScore > -.greatestFiniteMagnitude,
-                   let bestIdx = letterLogits.firstIndex(of: bestScore) {
-                    // softmax — numerically stable: subtract max
-                    let expValues = letterLogits.map { Double(exp(Double($0 - bestScore))) }
-                    let sumExp = expValues.reduce(0.0, +)
-                    let confidence = sumExp > 0 ? expValues[bestIdx] / sumExp : 0.0
-                    let result = usableFolders[bestIdx]
-                    if confidence < Self.confidenceThreshold {
-                        llmLogger.info("[Mistral 7B] 신뢰도 부족 (\(Int(confidence * 100), privacy: .public)% < \(Int(Self.confidenceThreshold * 100), privacy: .public)%) — '일반'으로 fallback: \(sanitizedTitle, privacy: .public) (would have been \(result, privacy: .public))")
-                        return ("일반", confidence)
-                    }
-                    llmLogger.info("[Mistral 7B] 분류 성공 (fast): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public) (\(labels[bestIdx], privacy: .public), \(Int(confidence * 100), privacy: .public)%)")
-                    return (result, confidence)
-                }
-                llmLogger.warning("[Mistral 7B] fast path 매치 0건 — top-K fallback")
-            }
-
-            // Fallback: 알파벳 맵이 비었거나 fast path 실패 시 top-K 탐색. 신뢰도 보수적 0.5 → threshold 미만 → 일반.
-            if let logits = finalLogits {
-                let topTokens = getTopK(from: logits, k: 10)
-                for token in topTokens {
-                    let word = tokenizer.decode(tokens: [token])
-                    let clean = word.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    .trimmingCharacters(in: .punctuationCharacters)
-                                    .uppercased()
-                    if clean.count == 1, let index = labels.firstIndex(of: clean) {
-                        let result = usableFolders[index]
-                        let confidence = 0.5
-                        if confidence < Self.confidenceThreshold {
-                            llmLogger.info("[Mistral 7B] 신뢰도 부족 (top-K \(Int(confidence * 100), privacy: .public)%) — '일반'으로 fallback: \(sanitizedTitle, privacy: .public)")
-                            return ("일반", confidence)
-                        }
-                        llmLogger.info("[Mistral 7B] 분류 성공 (top-K): \(sanitizedTitle, privacy: .public) -> \(result, privacy: .public)")
-                        return (result, confidence)
-                    }
-                }
-            }
-        } catch {
-            llmLogger.error("[Mistral 7B] 추론 에러: \(error.localizedDescription, privacy: .public)")
-        }
-
-        llmLogger.warning("[Mistral 7B] 분류 실패, '일반' 반환: task='\(sanitizedTitle, privacy: .public)'")
-        return ("일반", 0.0)
-    }
-
-    private func getTopK(from logits: MLMultiArray, k: Int) -> [Int] {
-        var topTokens = [(index: Int, score: Float)]()
-        topTokens.reserveCapacity(logits.count)
-        for i in 0..<logits.count {
-            topTokens.append((index: i, score: logits[i].floatValue))
-        }
-        topTokens.sort { $0.score > $1.score }
-        return topTokens.prefix(k).map { $0.index }
-    }
-
-    private func sanitize(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "[INST]", with: "")
-            .replacingOccurrences(of: "[/INST]", with: "")
-            .replacingOccurrences(of: "<s>", with: "")
-            .replacingOccurrences(of: "</s>", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

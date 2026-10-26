@@ -15,10 +15,7 @@ See [Implementation Status](#implementation-status) for what works today and wha
 ## Features
 
 - **On-device classification** — a local LLM sorts task titles into folders (courses / categories).
-- **Multi-model backend** — pick a model on first launch, switchable in Settings:
-  - **Gemma 4 E2B** — fast, ANE-optimized (~0.7s/task)
-  - **Gemma 4 E4B** — more accurate, prefill-chunk accelerated (~1.7s/task once warm)
-  - **Mistral 7B** — exposes softmax confidence (%)
+- **Gemma 4 E4B** — the single classification model: more accurate, prefill-chunk accelerated (~1.7s/task once warm). First launch goes straight to a download prompt (no model picker). The multi-model selection UI is retained in code for future re-introduction.
 - **Manual correction + few-shot learning** — when you re-file a task, the correction is fed back as an in-context example for future classifications.
 - **Two-way Apple Calendar sync** — events sync through a dedicated "CPlanner" calendar.
 - **Privacy-focused** — the network is used only for the initial model download; all inference is on-device.
@@ -28,18 +25,17 @@ See [Implementation Status](#implementation-status) for what works today and wha
 `v0.1.0` is an early pre-release. The core loop (capture → on-device classify → calendar sync) works; polish and several features are still pending.
 
 **Done**
-- On-device multi-model classification — first-launch picker, switchable in Settings (Gemma 4 E2B / E4B / Mistral 7B)
+- On-device classification with Gemma 4 E4B (single model) — first launch prompts download directly; model-selection UI kept dormant in code for future models
 - E4B full-bundle (prefill) auto-download from Hugging Face + eager prefill load + download **stall watchdog** (auto-retries a stalled transfer instead of hanging)
 - Two-way Apple Calendar sync via a dedicated "CPlanner" calendar
 - Manual re-filing + few-shot learning from corrections
-- Softmax confidence % (Mistral) with a 75% threshold → "일반" (general) fallback
 - Exact-match shortcut (repeat titles skip the LLM)
-- Compute-unit benchmark + tuned defaults (ANE for Gemma, CPU+GPU for Mistral)
+- Compute-unit benchmark + tuned defaults (ANE for Gemma)
 - Calendar UI: squircle cells, per-day task dots/checks, month-swipe transitions, Korean holiday highlighting
 - Dark Todomate-style design, in-app Settings (⌘,), rotating tip bar
 
 **Not yet implemented / rough edges**
-- Settings → Classification tab toggles (confidence threshold, exact-match) are UI-only, not yet wired to the engine
+- Classification settings: the exact-match toggle is UI-only (not yet wired); the confidence threshold is retained as an internal option (hidden from the UI — Gemma's confidence is binary, so it isn't user-facing)
 - Prompt-length guard (many folders / long titles could approach the context ceiling)
 - Background-execution policy (model memory release, launch-at-login, battery impact)
 - Whole-screen UI/UX pass (information density, spacing, light mode)
@@ -53,7 +49,7 @@ See [Implementation Status](#implementation-status) for what works today and wha
 
 - **Language / UI:** Swift, SwiftUI
 - **AI/ML:** CoreML, [CoreML-LLM](https://github.com/john-rocky/CoreML-LLM) (Gemma 4 chunked SWA), [swift-transformers](https://github.com/huggingface/swift-transformers) (Hub download + tokenizers)
-- **Models:** Gemma 4 E2B / E4B (CoreML), Mistral 7B Instruct v0.3 (Int4, CoreML)
+- **Models:** Gemma 4 E4B (CoreML)
 - **Platforms:** macOS 15.0+, iOS 18.0+
 
 ## Getting Started
