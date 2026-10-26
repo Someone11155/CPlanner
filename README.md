@@ -26,7 +26,7 @@ See [Implementation Status](#implementation-status) for what works today and wha
 
 **Done**
 - On-device classification with Gemma 4 E4B (single model) — first launch prompts download directly; model-selection UI kept dormant in code for future models
-- E4B full-bundle (prefill) auto-download from Hugging Face + eager prefill load + download **stall watchdog** (auto-retries a stalled transfer instead of hanging)
+- E4B full-bundle (prefill) auto-download from Hugging Face + eager prefill load + per-file resumable downloader (HTTP Range resume, 60s idle timeout drops a stalled connection, persistent staging folder so a restart picks up where it left off)
 - Two-way Apple Calendar sync via a dedicated "CPlanner" calendar
 - Manual re-filing + few-shot learning from corrections
 - Exact-match shortcut (repeat titles skip the LLM)
@@ -42,7 +42,7 @@ See [Implementation Status](#implementation-status) for what works today and wha
 - Performance optimization (task lookups, per-cell filtering)
 - Empty states, keyboard navigation, ad-hoc folder creation, learning-history management UI
 - Recurring calendar events (currently skipped with a warning)
-- Download resume across app restarts (the current watchdog retries within a session only)
+- Download progress / cancel / resume UI (resume itself is implemented but not yet verified end-to-end on the full ~8 GB download)
 - iOS build (developed and tested on macOS so far)
 
 ## Tech Stack
